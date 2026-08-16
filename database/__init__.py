@@ -1,0 +1,24 @@
+"""
+Database package for persistent encrypted chat storage.
+"""
+from .database import (
+    init_db,
+    store_message,
+    load_history_raw,
+    save_public_key,
+    load_public_key,
+    get_message_by_id,
+    tamper_message,
+    DB_PATH,
+)
+
+__all__ = [
+    "init_db",
+    "store_message",
+    "load_history_raw",
+    "save_public_key",
+    "load_public_key",
+    "get_message_by_id",
+    "tamper_message",
+    "DB_PATH",
+]
