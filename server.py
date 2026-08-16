@@ -1,435 +1,327 @@
 import asyncio
 import json
+import os
+import sys
+from datetime import datetime, timezone
 import websockets
 
+from database import (
+    init_db,
+    store_message,
+    load_history_raw,
+    load_public_key,
+    DB_PATH,
+)
+from crypto import (
+    encrypt_message,
+    decrypt_message,
+    sign_message,
+    verify_signature,
+    construct_canonical_payload,
+    KeyManager,
+)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-HOST = "0.0.0.0"
-PORT = 4000
-
+HOST = os.getenv("CHAT_HOST", "0.0.0.0")
+PORT = int(os.getenv("CHAT_PORT", "4000"))
 MAX_USERS = 4
+ROOM_ID = "main"
+HISTORY_LIMIT = 50
 
-
-# Only these four people are allowed.
-# CHANGE THESE TO YOUR ACTUAL GROUP MEMBERS.
-
+# Authorized users & access codes
 AUTHORIZED_USERS = {
     "ganesh": "12341080",
     "venu": "12341110",
     "venkat": "12341070",
-    "dheemanth": "12341710"
+    "dheemanth": "12341710",
 }
 
-
-# websocket -> user information
+# State tracking: websocket connection -> user info dict
 connected_users = {}
 
-
-# ============================================================
-# SEND JSON TO ONE CLIENT
-# ============================================================
-
-async def send_json(websocket, data):
-
-    await websocket.send(
-        json.dumps(data)
-    )
+# Key Manager instance
+key_manager = KeyManager(db_path=DB_PATH)
 
 
 # ============================================================
-# BROADCAST TO ALL CONNECTED USERS
+# WEBSOCKET HELPERS
 # ============================================================
 
-async def broadcast(data):
+async def send_json(websocket, data: dict):
+    """Send JSON message to a single WebSocket client."""
+    await websocket.send(json.dumps(data))
 
+
+async def broadcast(data: dict):
+    """Broadcast JSON message to all currently connected WebSocket clients."""
     if not connected_users:
         return
 
     message = json.dumps(data)
-
     await asyncio.gather(
-        *(
-            websocket.send(message)
-            for websocket in connected_users
-        ),
-        return_exceptions=True
+        *(ws.send(message) for ws in connected_users),
+        return_exceptions=True,
     )
 
 
-# ============================================================
-# SEND ONLINE USER LIST
-# ============================================================
-
 async def send_user_list():
-
-    users = [
-        {
-            "username": user["username"]
-        }
-        for user in connected_users.values()
-    ]
-
-    await broadcast({
-        "type": "user_list",
-        "users": users
-    })
+    """Broadcast current list of online users."""
+    users = [{"username": user["username"]} for user in connected_users.values()]
+    await broadcast({"type": "user_list", "users": users})
 
 
 # ============================================================
-# HANDLE CLIENT
+# CHAT HISTORY LOADER & VERIFIER
+# ============================================================
+
+def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT) -> list[dict]:
+    """
+    Retrieve encrypted messages from SQLite, decrypt ciphertext using AES-GCM,
+    and verify digital signatures against the canonical payload.
+    
+    Returns list of message dicts formatted for the client UI.
+    """
+    raw_records = load_history_raw(room_id=room_id, limit=limit, db_path=DB_PATH)
+    history = []
+
+    for record in raw_records:
+        msg_id = record["message_id"]
+        sender_id = record["sender_id"]
+        ciphertext = record["ciphertext"]
+        nonce = record["nonce"]
+        signature = record["signature"]
+        timestamp = record["timestamp"]
+
+        # 1. AES-GCM Decryption
+        try:
+            plaintext = decrypt_message(ciphertext, nonce)
+            decrypted_ok = True
+        except Exception as e:
+            print(f"[SECURITY WARNING] Failed to decrypt message_id {msg_id} from {sender_id}: {e}")
+            plaintext = "[message could not be decrypted - ciphertext tampered or key mismatch]"
+            decrypted_ok = False
+
+        # 2. Signature Verification
+        verified = False
+        if decrypted_ok:
+            try:
+                canonical_payload = construct_canonical_payload(
+                    room_id=room_id,
+                    sender_id=sender_id,
+                    message=plaintext,
+                    timestamp=timestamp,
+                )
+                pub_bytes = key_manager.get_public_key_bytes(sender_id)
+
+                if pub_bytes and verify_signature(pub_bytes, canonical_payload, signature):
+                    verified = True
+                else:
+                    print(f"[SECURITY ALERT] Digital signature verification FAILED for message_id {msg_id} from {sender_id}!")
+            except Exception as e:
+                print(f"[SECURITY ALERT] Signature check error for message_id {msg_id}: {e}")
+
+        history.append({
+            "message_id": msg_id,
+            "username": sender_id,
+            "message": plaintext,
+            "timestamp": timestamp,
+            "verified": verified,
+        })
+
+    return history
+
+
+# ============================================================
+# CLIENT WEBSOCKET HANDLER
 # ============================================================
 
 async def chat(websocket):
-
-    ip = websocket.remote_address[0]
-
+    ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
     username = None
 
     try:
-
         # ----------------------------------------------------
-        # First message must contain authentication information
+        # 1. Authentication Handshake
         # ----------------------------------------------------
-
-        raw_message = await websocket.recv()
-
+        raw_auth = await websocket.recv()
         try:
-            data = json.loads(raw_message)
-
-        except json.JSONDecodeError:
-
-            await send_json(websocket, {
-                "type": "error",
-                "message": "Invalid authentication request."
-            })
-
+            auth_data = json.loads(raw_auth)
+        except (json.JSONDecodeError, TypeError):
+            await send_json(websocket, {"type": "error", "message": "Invalid JSON format."})
             await websocket.close()
-
             return
 
-
-        if data.get("type") != "authenticate":
-
-            await send_json(websocket, {
-                "type": "error",
-                "message": "Authentication required."
-            })
-
+        if auth_data.get("type") != "authenticate":
+            await send_json(websocket, {"type": "error", "message": "Authentication required."})
             await websocket.close()
-
             return
 
+        username = str(auth_data.get("username", "")).strip()
+        access_code = str(auth_data.get("access_code", "")).strip()
 
-        username = data.get("username", "").strip()
-        access_code = data.get("access_code", "").strip()
-
-
-        # ----------------------------------------------------
-        # Check username
-        # ----------------------------------------------------
-
+        # Check authorization
         if username not in AUTHORIZED_USERS:
-
-            print(
-                f"[REJECTED] Unknown user: "
-                f"{username} | IP: {ip}"
-            )
-
-            await send_json(websocket, {
-                "type": "error",
-                "message": "You are not authorized to access this chat."
-            })
-
+            print(f"[REJECTED] Unauthorized user attempt: '{username}' | IP: {ip}")
+            await send_json(websocket, {"type": "error", "message": "You are not authorized to access this chat."})
             await websocket.close()
-
             return
-
-
-        # ----------------------------------------------------
-        # Check access code
-        # ----------------------------------------------------
 
         if AUTHORIZED_USERS[username] != access_code:
-
-            print(
-                f"[REJECTED] Invalid access code for "
-                f"{username} | IP: {ip}"
-            )
-
-            await send_json(websocket, {
-                "type": "error",
-                "message": "Invalid access code."
-            })
-
+            print(f"[REJECTED] Invalid access code for '{username}' | IP: {ip}")
+            await send_json(websocket, {"type": "error", "message": "Invalid access code."})
             await websocket.close()
-
             return
 
-
-        # ----------------------------------------------------
-        # Check if user is already connected
-        # ----------------------------------------------------
-
-        existing_usernames = {
-            user["username"]
-            for user in connected_users.values()
-        }
-
-
-        if username in existing_usernames:
-
-            await send_json(websocket, {
-                "type": "error",
-                "message":
-                    f"{username} is already connected."
-            })
-
+        # Check active session duplicate
+        if any(user["username"] == username for user in connected_users.values()):
+            await send_json(websocket, {"type": "error", "message": f"User '{username}' is already connected."})
             await websocket.close()
-
             return
 
-
-        # ----------------------------------------------------
-        # Maximum 4 simultaneous users
-        # ----------------------------------------------------
-
+        # Check maximum capacity
         if len(connected_users) >= MAX_USERS:
-
-            print(
-                f"[REJECTED] Room full | "
-                f"IP: {ip}"
-            )
-
-            await send_json(websocket, {
-                "type": "error",
-                "message":
-                    "Chat room is full. "
-                    "Maximum 4 users are allowed."
-            })
-
+            print(f"[REJECTED] Room full limit ({MAX_USERS}) reached | IP: {ip}")
+            await send_json(websocket, {"type": "error", "message": f"Chat room full. Maximum {MAX_USERS} users allowed."})
             await websocket.close()
-
             return
 
-
         # ----------------------------------------------------
-        # Authentication successful
+        # 2. Register Session & Keypair Setup
         # ----------------------------------------------------
-
+        private_key, _pub_bytes = key_manager.get_or_create_user_keypair(username)
         connected_users[websocket] = {
             "username": username,
-            "ip": ip
+            "ip": ip,
+            "private_key": private_key,
         }
 
+        print(f"[JOIN] {username} connected from {ip} | Online: {len(connected_users)}/{MAX_USERS}")
 
-        print(
-            f"[JOIN] {username} | IP: {ip}"
-        )
+        # Send authentication success frame
+        await send_json(websocket, {"type": "authenticated", "username": username})
 
-        print(
-            f"Online users: "
-            f"{len(connected_users)}/{MAX_USERS}"
-        )
+        # ----------------------------------------------------
+        # 3. Send Persistent Chat History
+        # ----------------------------------------------------
+        history_messages = get_processed_history(ROOM_ID, HISTORY_LIMIT)
+        if history_messages:
+            await send_json(websocket, {
+                "type": "history",
+                "messages": history_messages,
+            })
+            print(f"[HISTORY] Restored {len(history_messages)} messages for {username}")
 
-
-        # Tell client authentication succeeded
-
-        await send_json(websocket, {
-            "type": "authenticated",
-            "username": username
-        })
-
-
-        # Notify everyone
-
-        await broadcast({
-            "type": "system",
-            "message":
-                f"{username} joined the chat"
-        })
-
-
-        # Update online users
-
+        # Broadcast join notification & user list
+        await broadcast({"type": "system", "message": f"{username} joined the chat"})
         await send_user_list()
 
-
         # ----------------------------------------------------
-        # Receive messages
+        # 4. Real-time Message Loop
         # ----------------------------------------------------
-
-        async for raw_message in websocket:
-
+        async for raw_msg in websocket:
             try:
-
-                data = json.loads(raw_message)
-
-            except json.JSONDecodeError:
-
+                data = json.loads(raw_msg)
+            except (json.JSONDecodeError, TypeError):
                 continue
-
-
-            # Only process chat messages
 
             if data.get("type") != "message":
                 continue
 
-
-            message = data.get(
-                "message",
-                ""
-            ).strip()
-
-
-            # Ignore empty messages
-
-            if not message:
+            msg_text = str(data.get("message", "")).strip()
+            if not msg_text:
                 continue
 
+            # Validate message size (max 1000 characters)
+            msg_text = msg_text[:1000]
 
-            # Maximum message length
+            # Generate UTC ISO 8601 timestamp
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            message = message[:1000]
-
-
-            print(
-                f"[MESSAGE] "
-                f"{username}: "
-                f"{message}"
+            # Construct canonical payload for signature
+            canonical_payload = construct_canonical_payload(
+                room_id=ROOM_ID,
+                sender_id=username,
+                message=msg_text,
+                timestamp=timestamp,
             )
 
+            # Digital signature using sender's Ed25519 private key
+            user_private_key = connected_users[websocket]["private_key"]
+            signature_bytes = sign_message(user_private_key, canonical_payload)
 
-            # Broadcast message
+            # AES-256-GCM Encryption
+            ciphertext_bytes, nonce_bytes = encrypt_message(msg_text)
 
+            # Store encrypted representation in SQLite
+            store_message(
+                room_id=ROOM_ID,
+                sender_id=username,
+                ciphertext=ciphertext_bytes,
+                nonce=nonce_bytes,
+                signature=signature_bytes,
+                timestamp=timestamp,
+                db_path=DB_PATH,
+            )
+
+            print(f"[MESSAGE] {username}: {msg_text} (Encrypted & Signed)")
+
+            # Broadcast message with verified status
             await broadcast({
                 "type": "message",
-
                 "username": username,
-
-                "message": message
+                "message": msg_text,
+                "timestamp": timestamp,
+                "verified": True,
             })
-
 
     except websockets.exceptions.ConnectionClosed:
-
         pass
-
-
     except Exception as e:
-
-        print(
-            f"[ERROR] "
-            f"{username}: {e}"
-        )
-
-
+        print(f"[ERROR] Session exception for {username or ip}: {e}")
     finally:
-
-        # ----------------------------------------------------
-        # User disconnected
-        # ----------------------------------------------------
-
+        # Cleanup disconnected user
         if websocket in connected_users:
-
-            user = connected_users.pop(websocket)
-
-            username = user["username"]
-
-
-            print(
-                f"[LEAVE] "
-                f"{username} | "
-                f"IP: {ip}"
-            )
-
-            print(
-                f"Online users: "
-                f"{len(connected_users)}/{MAX_USERS}"
-            )
-
-
-            # Notify remaining users
-
-            await broadcast({
-                "type": "system",
-
-                "message":
-                    f"{username} left the chat"
-            })
-
-
-            # Update online users
-
+            user_info = connected_users.pop(websocket)
+            left_user = user_info["username"]
+            print(f"[LEAVE] {left_user} disconnected | Online: {len(connected_users)}/{MAX_USERS}")
+            await broadcast({"type": "system", "message": f"{left_user} left the chat"})
             await send_user_list()
 
 
 # ============================================================
-# SERVER
+# MAIN ENTRYPOINT
 # ============================================================
 
 async def main():
+    # Initialize Database tables
+    init_db(DB_PATH)
 
-    print("=" * 55)
+    # Initialize Ed25519 Keypairs for all authorized users
+    key_manager.initialize_keys_for_users(list(AUTHORIZED_USERS.keys()))
 
-    print(
-        "             REAL-TIME GROUP CHAT"
-    )
+    print("=" * 60)
+    print("         REAL-TIME GROUP CHAT  (persistent + secure)")
+    print("=" * 60)
+    print(f"WebSocket server listening on ws://{HOST}:{PORT}")
+    print(f"Maximum users: {MAX_USERS}")
+    print(f"Database: {DB_PATH}")
+    print(f"Encryption: AES-256-GCM")
+    print(f"Digital Signatures: Ed25519")
+    print("\nAuthorized users:")
+    for user in AUTHORIZED_USERS:
+        print(f"  - {user}")
+    print("\nServer is running. Waiting for connections...\n")
 
-    print("=" * 55)
-
-    print()
-
-    print(
-        f"WebSocket server listening on "
-        f"{HOST}:{PORT}"
-    )
-
-    print(
-        f"Maximum users: {MAX_USERS}"
-    )
-
-    print()
-
-    print("Authorized users:")
-
-    for username in AUTHORIZED_USERS:
-
-        print(
-            f"  - {username}"
-        )
-
-    print()
-
-    async with websockets.serve(
-        chat,
-        HOST,
-        PORT
-    ):
-
-        print(
-            "Server is running..."
-        )
-
-        print(
-            "Waiting for users..."
-        )
-
-        print()
-
-        await asyncio.Future()
+    async with websockets.serve(chat, HOST, PORT):
+        await asyncio.Future()  # run forever
 
 
 if __name__ == "__main__":
-
     try:
-
         asyncio.run(main())
-
     except KeyboardInterrupt:
-
-        print(
-            "\nServer stopped."
-        )
+        print("\n[STOP] Server stopped by user.")
+        sys.exit(0)
