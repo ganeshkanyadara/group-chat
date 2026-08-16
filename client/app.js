@@ -1,12 +1,7 @@
-// ============================================================
-// CONFIGURATION
-// ============================================================
+// Dynamically connect to the backend WebSocket server
+const SERVER_IP = window.location.hostname || "localhost";
+const SERVER_PORT = 4000;
 
-// Change this to the IP address of your server machine.
-
-const SERVER_IP = "10.1.75.51";
-
-const SERVER_PORT = 4213;
 
 
 // ============================================================
@@ -331,6 +326,62 @@ function handleServerMessage(data) {
 
 
     // --------------------------------------------------------
+    // Chat history (sent once on join)
+    // --------------------------------------------------------
+
+    if (
+        data.type ===
+        "history"
+    ) {
+
+        // Show a top divider before history messages
+        const topDivider =
+            document.createElement("div");
+
+        topDivider.className =
+            "history-divider";
+
+        topDivider.textContent =
+            "— start of history —";
+
+        messages.appendChild(topDivider);
+
+
+        data.messages.forEach(
+            function(msg) {
+
+                addMessage(
+                    msg.username,
+                    msg.message,
+                    msg.timestamp,
+                    msg.verified,
+                    true        // isHistory flag
+                );
+
+            }
+        );
+
+
+        const bottomDivider =
+            document.createElement("div");
+
+        bottomDivider.className =
+            "history-divider";
+
+        bottomDivider.textContent =
+            "— new messages below —";
+
+        messages.appendChild(bottomDivider);
+
+
+        scrollToBottom();
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
     // System message
     // --------------------------------------------------------
 
@@ -349,7 +400,7 @@ function handleServerMessage(data) {
 
 
     // --------------------------------------------------------
-    // Chat message
+    // Live chat message
     // --------------------------------------------------------
 
     if (
@@ -359,7 +410,10 @@ function handleServerMessage(data) {
 
         addMessage(
             data.username,
-            data.message
+            data.message,
+            data.timestamp,
+            data.verified,
+            false           // not history
         );
 
 
@@ -464,9 +518,11 @@ function sendMessage() {
 
 function addMessage(
     messageUsername,
-    message
+    message,
+    timestamp,
+    verified,
+    isHistory
 ) {
-
 
     const messageElement =
         document.createElement(
@@ -479,11 +535,14 @@ function addMessage(
         username;
 
 
-    messageElement.className =
-        isOwnMessage
-            ? "message own-message"
-            : "message";
+    let cls = "message";
+    if (isOwnMessage) cls += " own-message";
+    if (isHistory)    cls += " history-message";
 
+    messageElement.className = cls;
+
+
+    // -- Username label ----------------------------------------
 
     const userElement =
         document.createElement(
@@ -501,6 +560,8 @@ function addMessage(
             : messageUsername;
 
 
+    // -- Message bubble ----------------------------------------
+
     const textElement =
         document.createElement(
             "div"
@@ -517,15 +578,72 @@ function addMessage(
         message;
 
 
+    // -- Signature badge ----------------------------------------
+
+    if (verified !== undefined) {
+
+        const badge =
+            document.createElement(
+                "span"
+            );
+
+        badge.className =
+            verified
+                ? "verified-badge verified"
+                : "verified-badge unverified";
+
+        badge.title =
+            verified
+                ? "Signature verified ✓"
+                : "Signature could not be verified ✗";
+
+        badge.textContent =
+            verified ? "✓" : "✗";
+
+        textElement.appendChild(badge);
+
+    }
+
+
+    // -- Timestamp ---------------------------------------------
+
+    const metaRow =
+        document.createElement("div");
+
+    metaRow.className = "message-meta";
+
+
+    if (timestamp) {
+
+        const timeElement =
+            document.createElement(
+                "span"
+            );
+
+        timeElement.className =
+            "message-time";
+
+        timeElement.textContent =
+            formatTimestamp(timestamp);
+
+        metaRow.appendChild(timeElement);
+
+    }
+
+
+    // -- Assemble ----------------------------------------------
+
     messageElement.appendChild(
         userElement
     );
-
 
     messageElement.appendChild(
         textElement
     );
 
+    messageElement.appendChild(
+        metaRow
+    );
 
     messages.appendChild(
         messageElement
@@ -533,6 +651,32 @@ function addMessage(
 
 
     scrollToBottom();
+
+}
+
+
+// ============================================================
+// FORMAT TIMESTAMP
+// ============================================================
+
+function formatTimestamp(iso) {
+
+    if (!iso) return "";
+
+    try {
+
+        const d = new Date(iso);
+
+        return d.toLocaleTimeString(
+            [],
+            { hour: "2-digit", minute: "2-digit" }
+        );
+
+    } catch (e) {
+
+        return iso;
+
+    }
 
 }
 
