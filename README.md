@@ -276,6 +276,4 @@ This application was developed as a group project with four authorized members:
 
 ## Conclusion
 
-The project demonstrates a lightweight real-time communication system using Python WebSockets with a responsive web-based frontend.
-
-The centralized WebSocket server manages authentication, connections, online users, and real-time message broadcasting for the four authorized group members.
+The project demonstrates a lightweight real-time communication system using Python WebSockets with a responsive web-based frontend
