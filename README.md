@@ -1,8 +1,137 @@
-# Real-Time Group Chat Application
+# Real-Time Group Chat Application (Persistent + Secure)
 
-A lightweight real-time **Group Chat Application** built using **Python WebSockets, HTML, CSS, and JavaScript**.
+A persistent, secure, real-time **Group Chat Application** built using **Python WebSockets, SQLite3, AES-256-GCM encryption, Ed25519 digital signatures, HTML5, CSS3, and JavaScript**.
 
-The application provides real-time communication between the four authorized members of the group.
+The application provides end-to-end real-time communication, encrypted persistence, sender digital signature verification, and tamper detection between the four authorized group members.
+
+---
+
+## Key Features
+
+- **Real-time Communication**: Low-latency WebSocket broadcasting for live messaging.
+- **SQLite Persistence**: Chat history is stored securely in an SQLite database (`chat.db`) and restored when a user connects.
+- **AES-256-GCM Encryption**: Plaintext messages are encrypted before being written to disk. The database contains ONLY binary ciphertext and nonces.
+- **Ed25519 Digital Signatures**: Messages are digitally signed using sender-specific private keys to ensure sender authenticity and non-repudiation.
+- **Tamper-Aware Verification**: Digital signatures are verified against canonical message payloads upon reading history or receiving messages. Modified ciphertext or signatures trigger security alerts.
+- **Authentication & Authorization**: Strict access control restricting connections to four pre-authorized group members (`ganesh`, `venu`, `venkat`, `dheemanth`).
+- **Key Management**: Ed25519 private keys persist in a protected `keys/` directory (git-ignored) while public keys are stored in SQLite for signature verification.
+- **Evaluation & Inspection Tools**: Dedicated scripts to inspect SQLite binary contents (`scripts/inspect_db.py`) and simulate tampering (`scripts/tamper_demo.py`).
+
+---
+
+## Security Architecture & Design
+
+### Cryptographic Distinction
+
+| Technology | Security Function | Description |
+|---|---|---|
+| **AES-256-GCM** | **Confidentiality** | Protects message contents from unauthorized inspection. Plaintext is encrypted with a unique 96-bit (12-byte) random nonce per message before SQLite storage. |
+| **Ed25519 Signature** | **Sender Authenticity & Tamper Detection** | Proves sender identity using asymmetric cryptography. Binds message content, timestamp, room ID, and sender ID into a canonical payload to detect any modification. |
+
+```text
+                 ┌───────────────┐
+                 │    Client     │
+                 └───────┬───────┘
+                         │
+                     WebSocket
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │ WebSocket     │
+                 │ Server        │
+                 └───────┬───────┘
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+             ▼                       ▼
+       Authentication          Crypto Layer
+                                     │
+                              ┌──────┴──────┐
+                              │             │
+                           AES-GCM      Signature
+                              │             │
+                              └──────┬──────┘
+                                     │
+                                     ▼
+                              ┌─────────────┐
+                              │   SQLite    │
+                              │  Database   │
+                              └─────────────┘
+```
+
+---
+
+## Database Schema (`chat.db`)
+
+The database table `messages` stores **ONLY** binary encrypted data:
+
+```sql
+CREATE TABLE IF NOT EXISTS messages (
+    message_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id     TEXT    NOT NULL,
+    sender_id   TEXT    NOT NULL,
+    ciphertext  BLOB    NOT NULL,
+    nonce       BLOB    NOT NULL,
+    signature   BLOB    NOT NULL,
+    timestamp   TEXT    NOT NULL
+);
+```
+
+Public keys for signature verification are stored in `user_keys`:
+
+```sql
+CREATE TABLE IF NOT EXISTS user_keys (
+    username    TEXT PRIMARY KEY,
+    public_key  BLOB NOT NULL
+);
+```
+
+> [!IMPORTANT]
+> **Plaintext is NEVER written to the database.** Inspecting `chat.db` directly shows only encrypted ciphertext blobs, random nonces, and binary signature signatures.
+
+---
+
+## Data Flow Diagrams
+
+### 1. Sending a New Message
+
+```text
+User types message
+        ↓
+WebSocket transmission
+        ↓
+Authenticate sender
+        ↓
+Validate message & create UTC timestamp
+        ↓
+Construct canonical message payload (room_id + sender_id + message + timestamp)
+        ↓
+Sign canonical payload with Sender's Ed25519 Private Key
+        ↓
+Encrypt plaintext with AES-256-GCM (fresh 12-byte random nonce)
+        ↓
+Store (ciphertext + nonce + signature) in SQLite `messages` table
+        ↓
+Broadcast decrypted representation + verification status to active WebSockets
+```
+
+### 2. Receiving Chat History (User Connection)
+
+```text
+User connects & Authenticates
+        ↓
+Query SQLite `messages` table for room history
+        ↓
+For every message record:
+        ├─ Decrypt ciphertext using AES-256-GCM
+        ├─ Reconstruct canonical payload (room_id + sender_id + plaintext + timestamp)
+        ├─ Retrieve sender's public key from `user_keys`
+        └─ Verify Ed25519 signature
+        ↓
+Send history frame to connected client (with verified status ✓ / ✗)
+        ↓
+WebSocket connection remains open for live messaging
+```
 
 ---
 
@@ -11,269 +140,152 @@ The application provides real-time communication between the four authorized mem
 ```text
 group-chat/
 │
-├── server.py
+├── server.py              # Main asynchronous WebSocket server
+├── README.md              # Complete project documentation
+├── requirements.txt        # Python dependency requirements
+├── .env.example           # Environment template
+├── .gitignore             # Excludes secret keys, .env, and chat.db
+├── chat.db                # SQLite database (generated at runtime)
 │
-├── README.md
+├── crypto/                # Cryptographic subpackage
+│   ├── __init__.py
+│   ├── encryption.py      # AES-256-GCM encryption and decryption
+│   ├── signing.py         # Ed25519 digital signatures & canonical payload
+│   └── key_manager.py     # Per-user Ed25519 keypair management
 │
-└── client/
-    ├── index.html
-    ├── style.css
-    └── app.js
+├── database/              # Persistence subpackage
+│   ├── __init__.py
+│   └── database.py        # SQLite connection, table schemas & CRUD
+│
+├── scripts/               # Management & evaluation scripts
+│   ├── generate_keys.py   # Pre-generates keys and .env file
+│   ├── inspect_db.py      # Dumps database records in raw binary/hex/b64 format
+│   └── tamper_demo.py     # Simulates message tampering in SQLite
+│
+├── tests/                 # Automated test suite
+│   └── test_chat.py       # 8 unit and integration security tests
+│
+└── client/                # Frontend Web Application
+    ├── index.html         # User Interface layout
+    ├── style.css          # Modern dark-themed styling
+    └── app.js             # Client WebSocket controller & badge renderer
 ```
 
 ---
 
-## Server Architecture (`server.py`)
+## Installation & Setup
 
-The backend server (`server.py`) is an **asynchronous event-driven WebSocket server** built using Python's `asyncio` engine and the `websockets` library.
+### 1. Prerequisites
 
-```mermaid
-graph TD
-    Main[main Entrypoint] --> Serve[websockets.serve on 0.0.0.0:4000]
-    Serve -->|New Socket Connection| ChatHandler[chat websocket Coroutine]
+Ensure Python 3.10+ is installed:
 
-    subgraph Server Processing Lifecycle [server.py]
-        ChatHandler --> AuthCheck{1. Authentication}
-        AuthCheck -->|Invalid / Room Full / Duplicate| Reject[Send Error & Close Socket]
-        AuthCheck -->|Authorized| RegSession[2. Register Session]
-
-        RegSession --> AddState[Add to connected_users dict]
-        RegSession --> BroadcastJoin[Broadcast Join Event & send_user_list]
-
-        RegSession --> MsgLoop[3. Receive Message Loop]
-        MsgLoop -->|type: message| BroadcastMsg[broadcast via asyncio.gather]
-
-        MsgLoop -->|Disconnect / Error| Cleanup[4. Cleanup Phase]
-        Cleanup --> RemoveState[Remove from connected_users dict]
-        Cleanup --> BroadcastLeave[Broadcast Leave Event & send_user_list]
-    end
-```
-
-### Core Components & Functions
-
-1. **Global Configuration & State**
-   - **`AUTHORIZED_USERS`**: Whitelist mapping authorized usernames to their access codes.
-   - **`connected_users`**: Global dictionary mapping active WebSocket connection objects to user metadata (`username`, `ip`).
-   - **`MAX_USERS`**: Capacity limit constant set to 4 simultaneous connections.
-
-2. **Key Functions & Coroutines**
-   - **`main()`**: Server startup function that initializes `websockets.serve(chat, HOST, PORT)` and runs the infinite `asyncio` event loop.
-   - **`chat(websocket)`**: Main per-client coroutine handling the full lifecycle: authentication handshake, active message loop, and disconnection cleanup.
-   - **`broadcast(data)`**: Serializes JSON data and sends it concurrently to all active clients in `connected_users` using `asyncio.gather(*..., return_exceptions=True)`.
-   - **`send_json(websocket, data)`**: Helper to serialize and transmit a JSON message to a single target WebSocket client.
-   - **`send_user_list()`**: Extracts all active usernames from `connected_users` and broadcasts the updated online user roster.
-
----
-
-## Requirements
-
-Before running the application, make sure Python 3 is installed.
-
-Check Python:
 ```bash
-python --version
+python3 --version
 ```
 
-Install the required WebSocket package:
+### 2. Install Dependencies
+
+Install required Python packages:
+
 ```bash
-pip install websockets
+pip install -r requirements.txt
 ```
 
-If `pip` is not available:
+*(Or activate your virtualenv, e.g., `source ~/Desktop/torch-env/bin/activate`)*
+
+### 3. Key Generation & Setup
+
+Run the key generator script to create symmetric encryption keys and Ed25519 user signing keypairs:
+
 ```bash
-pip3 install websockets
+python3 scripts/generate_keys.py
 ```
 
----
-
-## Setup
-
-Clone or copy the `group-chat` folder to the server.
-
-Go to the project directory:
-```bash
-cd ~/group-chat
-```
-
-The project should contain:
-- `server.py`
-- `client/`
+This creates `.env` with `CHAT_ENCRYPTION_KEY` and populates the `keys/` directory.
 
 ---
 
 ## Running the Application
 
-The application requires two terminals on the server.
+### Step 1: Start the Backend WebSocket Server
 
-### Terminal 1 — Start the Backend
+In Terminal 1:
 
-Go to the project directory:
-```bash
-cd ~/group-chat
-```
-
-Start the WebSocket server:
-```bash
-python server.py
-```
-or:
 ```bash
 python3 server.py
 ```
 
-The WebSocket backend runs on: `0.0.0.0:4000` in server
+The WebSocket server listens on `ws://0.0.0.0:4000`.
 
-The server handles:
-- User authentication
-- WebSocket connections
-- User management
-- Message broadcasting
-- Join notifications
-- Leave notifications
-- Client disconnections
+### Step 2: Start the Frontend HTTP Server
 
----
+In Terminal 2:
 
-### Terminal 2 — Start the Frontend
-
-Open another terminal/SSH session.
-
-Go to the client directory:
 ```bash
-cd ~/group-chat/client
+cd client
+python3 -m http.server 5000 --bind 0.0.0.0
 ```
 
-Start the HTTP server:
+### Step 3: Access the Application
+
+Open a browser and navigate to:
+`http://localhost:5000` (or `http://<SERVER_IP>:5000`)
+
+---
+
+## Authorized Credentials
+
+Only the following four authorized users can log in:
+
+| No. | Username | Access Code |
+|---|---|---|
+| 1 | `ganesh` | `12341080` |
+| 2 | `venu` | `12341110` |
+| 3 | `venkat` | `12341070` |
+| 4 | `dheemanth` | `12341710` |
+
+---
+
+## Evaluation & Demonstration Guides
+
+### 1. Database Plaintext Inspection
+
+To prove that raw plaintext is NOT stored in SQLite, run:
+
 ```bash
-python -m http.server 5000 --bind 0.0.0.0
+python3 scripts/inspect_db.py
 ```
 
-The frontend server runs on port: `5000`
+**Output Demonstration:**
+Displays records showing message_id, room_id, sender_id, base64-encoded binary ciphertext, nonce, and signature. Plaintext is non-existent in the database.
 
----
+### 2. Tampering & Signature Verification Demonstration
 
-## Access the Client URL
+To demonstrate that digital signatures detect database tampering:
 
-Open a web browser and visit:
-[http://10.1.75.51:5213](http://10.1.75.51:5213)
+1. Send a message in the chat (e.g. *"Meeting at 5 PM"*).
+2. Run the tamper demonstration script:
+   ```bash
+   python3 scripts/tamper_demo.py
+   ```
+3. Select option `2` to corrupt the signature (or option `1` to corrupt ciphertext).
+4. Refresh or reconnect the client.
+5. Notice that the corrupted message is flagged as unverified (**✗**) or fails decryption, proving that signature verification catches unauthorized modifications.
 
-The URL will open the User Login page. for authentication use the following credentials. After successful authentication, the user will be redirected to the group chat.
+### 3. Automated Test Suite
 
----
+Run all 8 security and persistence tests:
 
-## Authorized Group Members
-
-Only the following four members are authorized to access the application.
-
-| No. | Username | Password |
-|---|---|---|
-| 1 | ganesh | 12341080 |
-| 2 | venu | 12341110 |
-| 3 | venkat | 12341070 |
-| 4 | dheemanth | 12341710 |
-
-### Example Login
-- **Username:** `ganesh`
-- **Password:** `12341080`
-
-Users who are not in the authorized list cannot access the chat. Incorrect passwords will also be rejected.
-
----
-
-## Application Features
-
-- Real-time group messaging using WebSockets
-- Authentication for the four group members
-- Online users list
-- Maximum of four simultaneous users
-- User join notifications
-- User leave notifications
-- Real-time message broadcasting
-- Current user's messages displayed on the right
-- Other users' messages displayed on the left
-- Graceful handling of client disconnections
-- Responsive UI for desktop, tablet, and mobile devices
-- Lightweight frontend without external frameworks
-
----
-
-## Ports
-
-The application uses two ports:
-
-| Service | Port | URL / Address |
-|---|---|---|
-| Frontend HTTP Server | `5000` | `http://10.1.75.51:5213` |
-| WebSocket Backend | `4000` | `ws://10.1.75.51:4213` |
-
-
----
-
-## WebSocket Communication
-
-The frontend communicates with the Python backend using a persistent WebSocket connection.
-
-```text
-               WebSocket Server
-                 Python : 4213
-                      │
-       ┌──────────────┼──────────────┐─────────┤
-       │              │              │         │
-       ▼              ▼              ▼         ▼
-    Ganesh          Venu          Venkat    Dheemanth
+```bash
+python3 -m unittest discover -s tests
 ```
 
-Messages sent by one user are broadcast by the server to all connected users.
-
-
----
-
-## Application Flow
-
-```text
-User opens: http://10.1.75.51:5213
-        │
-        ▼
-   Login Page
-        │
-        ▼
-Username + Password
-        │
-        ▼
-Server Authentication
-        │
-    ┌───┴────┐
-    │        │
-  Valid    Invalid
-    │        │
-    ▼        ▼
- Chat      Reject
-    │
-    ▼
-WebSocket Connection
-    │
-    ▼
-Send / Receive Messages
-    │
-    ▼
-Server Broadcasts
-    │
-    ▼
-All Connected Users
-```
-
----
-
-## Group Members
-
-This application was developed as a group project with four authorized members:
-- Ganesh
-- Venu
-- Venkat
-- Dheemanth(12341710)
-
----
-
-## Conclusion
-
-The project demonstrates a lightweight real-time communication system using Python WebSockets with a responsive web-based frontend
+**Test Coverage:**
+- `test_1_normal_message_flow`: Message delivery, storage, decryption, signature validation.
+- `test_2_persistence`: DB survival and chat history restoration upon reconnect.
+- `test_3_encryption_no_plaintext_stored`: Verification that raw plaintext is absent from SQLite.
+- `test_4_decryption`: AES-256-GCM ciphertext decryption accuracy.
+- `test_5_signature_verification`: Ed25519 signature verification against canonical payloads.
+- `test_6_tampering_detection`: Detection of corrupted ciphertext or signature bytes.
+- `test_7_unauthorized_user`: Rejection of non-authorized usernames.
+- `test_8_multiple_users`: Multi-user key isolation and signing for all 4 group members.
