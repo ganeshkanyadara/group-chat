@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Group Chat</title>
+
+    <link
+        rel="stylesheet"
+        href="style.css"
+    >
+
+</head>
+
+
+<body>
+
+
+<!-- =====================================================
+     LOGIN SCREEN
+====================================================== -->
+
+<div id="login-screen" class="login-screen">
+
+
+    <div class="login-card">
+
+
+        <div class="logo">
+            GC
+        </div>
+
+
+        <h1>
+            Group Chat
+        </h1>
+
+
+        <p class="subtitle">
+            Private WebSocket Chat Room
+        </p>
+
+
+        <input
+            id="username-input"
+            type="text"
+            placeholder="Username"
+            maxlength="30"
+            autocomplete="off"
+        >
+
+
+        <input
+            id="access-code-input"
+            type="password"
+            placeholder="Access code"
+            maxlength="30"
+            autocomplete="off"
+        >
+
+
+        <button id="join-button">
+
+            Join Chat
+
+        </button>
+
+
+        <p
+            id="login-error"
+            class="login-error"
+        ></p>
+
+
+        <div class="member-info">
+
+            <span>Private group</span>
+
+            <span>•</span>
+
+            <span>4 members</span>
+
+        </div>
+
+
+    </div>
+
+</div>
+
+
+<!-- =====================================================
+     CHAT APPLICATION
+====================================================== -->
+
+<div
+    id="chat-screen"
+    class="chat-app hidden"
+>
+
+
+    <!-- =================================================
+         SIDEBAR
+    ================================================== -->
+
+    <aside class="sidebar">
+
+
+        <div class="sidebar-header">
+
+
+            <div class="brand">
+
+
+                <div class="brand-icon">
+
+                    GC
+
+                </div>
+
+
+                <div>
+
+                    <h2>
+                        Group Chat
+                    </h2>
+
+                    <span>
+                        Private Room
+                    </span>
+
+                </div>
+
+
+            </div>
+
+
+        </div>
+
+
+        <div class="online-title">
+
+
+            <span>
+                ONLINE USERS
+            </span>
+
+
+            <span
+                id="user-count"
+                class="user-count"
+            >
+                0 / 4
+            </span>
+
+
+        </div>
+
+
+        <div
+            id="user-list"
+            class="user-list"
+        >
+
+        </div>
+
+
+        <div class="sidebar-bottom">
+
+
+            <div class="connection-status">
+
+
+                <span
+                    id="status-dot"
+                    class="status-dot"
+                ></span>
+
+
+                <span id="connection-text">
+
+                    Connected
+
+                </span>
+
+
+            </div>
+
+
+        </div>
+
+
+    </aside>
+
+
+    <!-- =================================================
+         MAIN CHAT
+    ================================================== -->
+
+    <main class="chat">
+
+
+        <header class="chat-header">
+
+
+            <div>
+
+                <h1>
+                    Common Chat Room
+                </h1>
+
+                <p>
+                    Messages are visible to all members
+                </p>
+
+            </div>
+
+
+        </header>
+
+
+        <!-- Messages -->
+
+        <section
+            id="messages"
+            class="messages"
+        >
+
+        </section>
+
+
+        <!-- Message input -->
+
+        <div class="message-area">
+
+
+            <div class="message-box">
+
+
+                <input
+                    id="message-input"
+                    type="text"
+                    placeholder="Type a message..."
+                    maxlength="1000"
+                    autocomplete="off"
+                >
+
+
+                <button
+                    id="send-button"
+                >
+
+                    Send
+
+                </button>
+
+
+            </div>
+
+
+            <div class="input-hint">
+
+                Press Enter to send
+
+            </div>
+
+
+        </div>
+
+
+    </main>
+
+
+</div>
+
+
+<script src="app.js"></script>
+
+</body>
+
+</html>
