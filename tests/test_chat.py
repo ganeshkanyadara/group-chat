@@ -26,7 +26,6 @@ from crypto import (
     KeyManager,
     get_encryption_key,
 )
-from server import AUTHORIZED_USERS
 
 
 class TestGroupChatSecurityAndPersistence(unittest.TestCase):
@@ -164,16 +163,18 @@ class TestGroupChatSecurityAndPersistence(unittest.TestCase):
         # Signature verification must fail
         self.assertFalse(verify_signature(pub_bytes, canonical, tampered_sig))
 
-    def test_7_unauthorized_user(self):
-        """Test 7: Verify unauthorized users are rejected."""
-        unauthorized = "hacker"
-        self.assertNotIn(unauthorized, AUTHORIZED_USERS)
+    def test_7_dynamic_user_keypair_generation(self):
+        """Test 7: Verify dynamic keypair generation and signing for any new guest user."""
+        any_user = "guest_user_9999"
+        priv_key, pub_bytes = self.key_mgr.get_or_create_user_keypair(any_user)
+        canonical = construct_canonical_payload("main", any_user, "Hello from open user", "2026-08-16T12:25:00Z")
+        sig = sign_message(priv_key, canonical)
+        self.assertTrue(verify_signature(pub_bytes, canonical, sig))
 
     def test_8_multiple_users(self):
-        """Test 8: Verify all 4 authorized users can sign and verify messages independently."""
-        users = ["ganesh", "venu", "venkat", "dheemanth"]
+        """Test 8: Verify multiple arbitrary users can sign and verify messages independently."""
+        users = ["user_alpha", "user_beta", "user_gamma", "user_delta"]
         for u in users:
-            self.assertIn(u, AUTHORIZED_USERS)
             priv, pub = self.key_mgr.get_or_create_user_keypair(u)
             canonical = construct_canonical_payload("main", u, f"Hello from {u}", "2026-08-16T12:30:00Z")
             sig = sign_message(priv, canonical)

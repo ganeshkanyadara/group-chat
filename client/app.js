@@ -35,12 +35,6 @@ const usernameInput =
     );
 
 
-const accessCodeInput =
-    document.getElementById(
-        "access-code-input"
-    );
-
-
 const joinButton =
     document.getElementById(
         "join-button"
@@ -111,20 +105,6 @@ usernameInput.addEventListener(
 
         if (event.key === "Enter") {
 
-            accessCodeInput.focus();
-
-        }
-
-    }
-);
-
-
-accessCodeInput.addEventListener(
-    "keydown",
-    function(event) {
-
-        if (event.key === "Enter") {
-
             joinChat();
 
         }
@@ -143,25 +123,17 @@ function joinChat() {
         usernameInput.value.trim();
 
 
-    const accessCode =
-        accessCodeInput.value.trim();
-
-
     if (!username) {
 
-        loginError.textContent =
-            "Please enter your username.";
+        const randomNum =
+            Math.floor(1000 + Math.random() * 9000);
 
-        return;
-    }
+        username =
+            `Guest_${randomNum}`;
 
+        usernameInput.value =
+            username;
 
-    if (!accessCode) {
-
-        loginError.textContent =
-            "Please enter your access code.";
-
-        return;
     }
 
 
@@ -170,8 +142,7 @@ function joinChat() {
 
 
     connectToServer(
-        username,
-        accessCode
+        username
     );
 }
 
@@ -181,8 +152,7 @@ function joinChat() {
 // ============================================================
 
 function connectToServer(
-    username,
-    accessCode
+    username
 ) {
 
     const url =
@@ -201,7 +171,7 @@ function connectToServer(
             );
 
 
-            // Send authentication
+            // Send join request
 
             socket.send(
                 JSON.stringify({
@@ -210,10 +180,7 @@ function connectToServer(
                         "authenticate",
 
                     username:
-                        username,
-
-                    access_code:
-                        accessCode
+                        username
 
                 })
             );
@@ -725,7 +692,7 @@ function updateUserList(
 
 
     userCount.textContent =
-        `${users.length} / 4`;
+        `${users.length} Online`;
 
 
     users.forEach(

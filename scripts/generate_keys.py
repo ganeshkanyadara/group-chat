@@ -18,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from crypto import get_encryption_key, KeyManager
 from database import init_db, DB_PATH
 
-AUTHORIZED_USERS = ["ganesh", "venu", "venkat", "dheemanth"]
-
 
 def main():
     print("=======================================================")
@@ -40,17 +38,18 @@ def main():
         env_file.write_text(f"# Group Chat Security Environment Configuration\nCHAT_ENCRYPTION_KEY={aes_key.hex()}\n")
         print("[.env] Created default .env file with CHAT_ENCRYPTION_KEY.")
 
-    # 4. Generate Ed25519 user keypairs
+    # 4. Generate Ed25519 user keypairs (keys are created automatically on user join)
     km = KeyManager(db_path=DB_PATH)
-    print("\nGenerating/Verifying Ed25519 keypairs for authorized users:")
-    for username in AUTHORIZED_USERS:
+    sample_users = ["ganesh", "venu", "guest_1"]
+    print("\nGenerating/Verifying sample Ed25519 keypairs:")
+    for username in sample_users:
         priv_key, pub_bytes = km.get_or_create_user_keypair(username)
         pem_path = km.get_private_key_path(username)
         print(f"  - User '{username}':")
         print(f"      Private key file: {pem_path}")
         print(f"      Public key (hex):  {pub_bytes.hex()[:32]}...")
 
-    print("\n[SUCCESS] All encryption and signing keys initialized successfully.")
+    print("\n[SUCCESS] Encryption and signing infrastructure initialized successfully.")
 
 
 if __name__ == "__main__":

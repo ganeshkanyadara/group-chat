@@ -1,6 +1,8 @@
 # Security & Secret Keys
 .env
 keys/
+pdf.tex
+pdf.log
 
 # Database
 *.db

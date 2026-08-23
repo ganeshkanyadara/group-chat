@@ -27,17 +27,9 @@ from crypto import (
 
 HOST = os.getenv("CHAT_HOST", "0.0.0.0")
 PORT = int(os.getenv("CHAT_PORT", "4000"))
-MAX_USERS = 4
+MAX_USERS = 1000
 ROOM_ID = "main"
 HISTORY_LIMIT = 50
-
-# Authorized users & access codes
-AUTHORIZED_USERS = {
-    "ganesh": "12341080",
-    "venu": "12341110",
-    "venkat": "12341070",
-    "dheemanth": "12341710",
-}
 
 # State tracking: websocket connection -> user info dict
 connected_users = {}
@@ -144,7 +136,7 @@ async def chat(websocket):
 
     try:
         # ----------------------------------------------------
-        # 1. Authentication Handshake
+        # 1. Open Access Join Handshake
         # ----------------------------------------------------
         raw_auth = await websocket.recv()
         try:
@@ -154,32 +146,22 @@ async def chat(websocket):
             await websocket.close()
             return
 
-        if auth_data.get("type") != "authenticate":
-            await send_json(websocket, {"type": "error", "message": "Authentication required."})
+        if auth_data.get("type") not in ("authenticate", "join"):
+            await send_json(websocket, {"type": "error", "message": "Join request required."})
             await websocket.close()
             return
 
-        username = str(auth_data.get("username", "")).strip()
-        access_code = str(auth_data.get("access_code", "")).strip()
+        requested_name = str(auth_data.get("username", "")).strip()
+        if not requested_name:
+            import random
+            requested_name = f"Guest_{random.randint(1000, 9999)}"
 
-        # Check authorization
-        if username not in AUTHORIZED_USERS:
-            print(f"[REJECTED] Unauthorized user attempt: '{username}' | IP: {ip}")
-            await send_json(websocket, {"type": "error", "message": "You are not authorized to access this chat."})
-            await websocket.close()
-            return
-
-        if AUTHORIZED_USERS[username] != access_code:
-            print(f"[REJECTED] Invalid access code for '{username}' | IP: {ip}")
-            await send_json(websocket, {"type": "error", "message": "Invalid access code."})
-            await websocket.close()
-            return
-
-        # Check active session duplicate
-        if any(user["username"] == username for user in connected_users.values()):
-            await send_json(websocket, {"type": "error", "message": f"User '{username}' is already connected."})
-            await websocket.close()
-            return
+        # Ensure unique display name per active connection
+        username = requested_name
+        counter = 1
+        while any(user["username"] == username for user in connected_users.values()):
+            username = f"{requested_name}_{counter}"
+            counter += 1
 
         # Check maximum capacity
         if len(connected_users) >= MAX_USERS:
@@ -299,20 +281,15 @@ async def main():
     # Initialize Database tables
     init_db(DB_PATH)
 
-    # Initialize Ed25519 Keypairs for all authorized users
-    key_manager.initialize_keys_for_users(list(AUTHORIZED_USERS.keys()))
-
     print("=" * 60)
-    print("         REAL-TIME GROUP CHAT  (persistent + secure)")
+    print("         REAL-TIME GROUP CHAT  (persistent + open access)")
     print("=" * 60)
     print(f"WebSocket server listening on ws://{HOST}:{PORT}")
-    print(f"Maximum users: {MAX_USERS}")
+    print(f"Maximum capacity: {MAX_USERS} users")
     print(f"Database: {DB_PATH}")
     print(f"Encryption: AES-256-GCM")
     print(f"Digital Signatures: Ed25519")
-    print("\nAuthorized users:")
-    for user in AUTHORIZED_USERS:
-        print(f"  - {user}")
+    print("Access Mode: Public (No authentication required)")
     print("\nServer is running. Waiting for connections...\n")
 
     async with websockets.serve(chat, HOST, PORT):
