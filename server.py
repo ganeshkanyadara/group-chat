@@ -27,7 +27,7 @@ from crypto import (
 
 HOST = os.getenv("CHAT_HOST", "0.0.0.0")
 PORT = int(os.getenv("CHAT_PORT", "4000"))
-MAX_USERS = 1000
+MAX_USERS = 5000
 ROOM_ID = "main"
 HISTORY_LIMIT = 50
 
