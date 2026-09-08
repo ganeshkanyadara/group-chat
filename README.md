@@ -239,7 +239,7 @@ Only the following four authorized users can log in:
 
 | No. | Username | Access Code |
 |---|---|---|
-| 1 | `ganesh` | `12341080` |
+| 1 | `kanyadara ganesh babu` | `12341080` |
 | 2 | `venu` | `12341110` |
 | 3 | `venkat` | `12341070` |
 | 4 | `dheemanth` | `12341710` |
