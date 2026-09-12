@@ -493,14 +493,17 @@ def clear_backend_users(backend_id: str, db_path: str = DB_PATH) -> bool:
     return True
 
 
-def get_all_online_users(db_path: str = DB_PATH, prune_seconds: int = 60) -> list[dict]:
+def get_all_online_users(db_path: str = DB_PATH, prune_seconds: int = 60) -> list[dict] | None:
     """Retrieve all currently active users across the cluster."""
     target_path = db_path or get_db_path()
     if is_remote_db(target_path):
-        res = _http_request(f"{target_path.rstrip('/')}/users", method="GET")
-        if res and "users" in res:
-            return res["users"]
-        return []
+        try:
+            res = _http_request(f"{target_path.rstrip('/')}/users", method="GET")
+            if res and res.get("status") == "success" and "users" in res:
+                return res["users"]
+        except Exception:
+            pass
+        return None
 
     now = int(time.time())
     con = get_db_connection(target_path)

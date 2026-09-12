@@ -115,10 +115,14 @@ async def broadcast(data: dict):
 async def send_user_list(app: web.Application | None = None):
     """Broadcast current list of online users combining all systems in the cluster."""
     app_db_path = get_app_db_path(app) if app else DB_PATH
+    backend_id = get_app_backend_id(app) if app else BACKEND_ID
+    users = None
     try:
         users = get_all_online_users(db_path=app_db_path)
-    except Exception as e:
-        users = [{"username": user["username"], "backend_id": BACKEND_ID} for user in connected_users.values()]
+    except Exception:
+        pass
+    if users is None:
+        users = [{"username": user["username"], "backend_id": backend_id} for user in connected_users.values()]
     await broadcast({"type": "user_list", "users": users})
 
 
@@ -563,9 +567,12 @@ async def get_users_handler(request: web.Request) -> web.Response:
     """Returns cluster-wide online users combining all 3 backend systems."""
     app_db_path = get_app_db_path(request.app)
     backend_id = get_app_backend_id(request.app)
+    users = None
     try:
         users = get_all_online_users(db_path=app_db_path)
     except Exception:
+        pass
+    if users is None:
         users = [{"username": u["username"], "backend_id": backend_id} for u in connected_users.values()]
     return web.json_response({
         "status": "success",
@@ -622,10 +629,11 @@ async def presence_background_loop(app: web.Application):
             # 2. Fetch cluster-wide online users and broadcast if changed
             try:
                 cluster_users = get_all_online_users(db_path=app_db_path)
-                current_json = json.dumps([{"u": x.get("username"), "b": x.get("backend_id")} for x in cluster_users], sort_keys=True)
-                if current_json != last_users_json:
-                    last_users_json = current_json
-                    await broadcast({"type": "user_list", "users": cluster_users})
+                if cluster_users is not None:
+                    current_json = json.dumps([{"u": x.get("username"), "b": x.get("backend_id")} for x in cluster_users], sort_keys=True)
+                    if current_json != last_users_json:
+                        last_users_json = current_json
+                        await broadcast({"type": "user_list", "users": cluster_users})
             except Exception:
                 pass
     except asyncio.CancelledError:
