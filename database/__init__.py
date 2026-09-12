@@ -12,6 +12,10 @@ from .database import (
     check_db_health,
     get_db_connection,
     get_db_path,
+    register_online_user,
+    remove_online_user,
+    clear_backend_users,
+    get_all_online_users,
     DB_PATH,
 )
 
@@ -26,6 +30,10 @@ __all__ = [
     "check_db_health",
     "get_db_connection",
     "get_db_path",
+    "register_online_user",
+    "remove_online_user",
+    "clear_backend_users",
+    "get_all_online_users",
     "DB_PATH",
 ]
 

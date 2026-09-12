@@ -33,6 +33,10 @@ from database import (
     load_history_raw,
     load_public_key,
     check_db_health,
+    register_online_user,
+    remove_online_user,
+    clear_backend_users,
+    get_all_online_users,
     DB_PATH,
     get_db_path,
 )
@@ -108,9 +112,13 @@ async def broadcast(data: dict):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def send_user_list():
-    """Broadcast current list of online users."""
-    users = [{"username": user["username"]} for user in connected_users.values()]
+async def send_user_list(app: web.Application | None = None):
+    """Broadcast current list of online users combining all systems in the cluster."""
+    app_db_path = get_app_db_path(app) if app else DB_PATH
+    try:
+        users = get_all_online_users(db_path=app_db_path)
+    except Exception as e:
+        users = [{"username": user["username"], "backend_id": BACKEND_ID} for user in connected_users.values()]
     await broadcast({"type": "user_list", "users": users})
 
 
@@ -452,6 +460,16 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             await ws.close()
             return ws
 
+        app = request.app
+        app_backend_id = get_app_backend_id(app)
+        app_db_path = get_app_db_path(app)
+
+        # 1. Register presence in shared cluster database
+        try:
+            register_online_user(username, app_backend_id, db_path=app_db_path)
+        except Exception as e:
+            print(f"[{app_backend_id}] [PRESENCE WARNING] Failed to register {username}: {e}")
+
         # 2. Keypair registration
         private_key, _pub_bytes = key_manager.get_or_create_user_keypair(username)
         connected_users[ws] = {
@@ -460,11 +478,11 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             "private_key": private_key,
         }
 
-        print(f"[{BACKEND_ID}] [JOIN] {username} connected from {ip} | Online: {len(connected_users)}/{MAX_USERS}")
+        print(f"[{app_backend_id}] [JOIN] {username} connected from {ip} | Online: {len(connected_users)}/{MAX_USERS}")
         await send_json(ws, {"type": "authenticated", "username": username})
 
         # 3. History delivery
-        history_messages = get_processed_history(ROOM_ID, HISTORY_LIMIT)
+        history_messages = get_processed_history(ROOM_ID, HISTORY_LIMIT, db_path=app_db_path)
         if history_messages:
             await send_json(ws, {
                 "type": "history",
@@ -472,7 +490,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             })
 
         await broadcast({"type": "system", "message": f"{username} joined the chat"})
-        await send_user_list()
+        await send_user_list(app)
 
         # 4. Message loop
         async for msg in ws:
@@ -510,7 +528,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     nonce=nonce_bytes,
                     signature=signature_bytes,
                     timestamp=timestamp,
-                    db_path=DB_PATH,
+                    db_path=app_db_path,
                 )
 
                 await broadcast({
@@ -531,17 +549,46 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             user_info = connected_users.pop(ws)
             left_user = user_info["username"]
             print(f"[{BACKEND_ID}] [LEAVE] {left_user} disconnected | Online: {len(connected_users)}/{MAX_USERS}")
+            try:
+                remove_online_user(left_user, app_backend_id, db_path=app_db_path)
+            except Exception:
+                pass
             await broadcast({"type": "system", "message": f"{left_user} left the chat"})
-            await send_user_list()
+            await send_user_list(app)
 
     return ws
+
+
+async def get_users_handler(request: web.Request) -> web.Response:
+    """Returns cluster-wide online users combining all 3 backend systems."""
+    app_db_path = get_app_db_path(request.app)
+    backend_id = get_app_backend_id(request.app)
+    try:
+        users = get_all_online_users(db_path=app_db_path)
+    except Exception:
+        users = [{"username": u["username"], "backend_id": backend_id} for u in connected_users.values()]
+    return web.json_response({
+        "status": "success",
+        "backend_id": backend_id,
+        "total_online": len(users),
+        "users": users,
+    })
 
 
 async def index_or_ws_handler(request: web.Request) -> web.StreamResponse:
     """Handles both WebSocket upgrades and general HTTP metadata on /."""
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await websocket_handler(request)
-    backend_id = request.app.get("backend_id", BACKEND_ID)
+
+    # If browser requests HTML UI
+    accept = request.headers.get("Accept", "")
+    if "text/html" in accept:
+        client_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client")
+        index_file = os.path.join(client_dir, "index.html")
+        if os.path.exists(index_file):
+            return web.FileResponse(index_file)
+
+    backend_id = request.app.get(BACKEND_ID_KEY, BACKEND_ID)
     return web.json_response({
         "service": "secure-group-chat-backend",
         "backend_id": backend_id,
@@ -551,9 +598,60 @@ async def index_or_ws_handler(request: web.Request) -> web.StreamResponse:
             "get_feed": "GET /feed",
             "get_health": "GET /health",
             "get_metrics": "GET /metrics",
+            "get_users": "GET /users",
             "websocket": f"ws://{HOST}:{PORT}/",
         },
     })
+
+
+async def presence_background_loop(app: web.Application):
+    """Periodically heartbeat locally connected users and broadcast updated cluster user list."""
+    app_backend_id = get_app_backend_id(app)
+    app_db_path = get_app_db_path(app)
+    last_users_json = ""
+    try:
+        while True:
+            await asyncio.sleep(4.0)
+            # 1. Heartbeat local active connections
+            local_users = [u["username"] for u in list(connected_users.values())]
+            for u in local_users:
+                try:
+                    register_online_user(u, app_backend_id, db_path=app_db_path)
+                except Exception:
+                    pass
+            # 2. Fetch cluster-wide online users and broadcast if changed
+            try:
+                cluster_users = get_all_online_users(db_path=app_db_path)
+                current_json = json.dumps([{"u": x.get("username"), "b": x.get("backend_id")} for x in cluster_users], sort_keys=True)
+                if current_json != last_users_json:
+                    last_users_json = current_json
+                    await broadcast({"type": "user_list", "users": cluster_users})
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
+async def start_background_tasks(app: web.Application):
+    """Startup and cleanup context for presence synchronization and heartbeat."""
+    app_backend_id = get_app_backend_id(app)
+    app_db_path = get_app_db_path(app)
+    try:
+        clear_backend_users(app_backend_id, db_path=app_db_path)
+    except Exception:
+        pass
+
+    task = asyncio.create_task(presence_background_loop(app))
+    yield
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        clear_backend_users(app_backend_id, db_path=app_db_path)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -572,8 +670,26 @@ def create_app(backend_id: str | None = None, db_path: str | None = None) -> web
     app.router.add_get("/feed", get_feed_handler)
     app.router.add_get("/health", get_health_handler)
     app.router.add_get("/metrics", get_metrics_handler)
+    app.router.add_get("/users", get_users_handler)
+    app.router.add_get("/online", get_users_handler)
     app.router.add_get("/", index_or_ws_handler)
     app.router.add_get("/ws", websocket_handler)
+
+    client_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client")
+    if os.path.exists(client_dir):
+        style_f = os.path.join(client_dir, "style.css")
+        app_f = os.path.join(client_dir, "app.js")
+        if os.path.exists(style_f):
+            async def serve_style(request):
+                return web.FileResponse(style_f)
+            app.router.add_get("/style.css", serve_style)
+        if os.path.exists(app_f):
+            async def serve_app(request):
+                return web.FileResponse(app_f)
+            app.router.add_get("/app.js", serve_app)
+        app.router.add_static("/client", client_dir)
+
+    app.cleanup_ctx.append(start_background_tasks)
     return app
 
 

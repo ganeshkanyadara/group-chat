@@ -3,6 +3,7 @@ import os
 import uuid
 import json
 import base64
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -139,6 +140,15 @@ def init_db(db_path: str = DB_PATH) -> None:
         CREATE TABLE IF NOT EXISTS user_keys (
             username    TEXT PRIMARY KEY,
             public_key  BLOB NOT NULL
+        );
+    """)
+
+    # Table storing multi-node online presence
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS active_users (
+            username    TEXT PRIMARY KEY,
+            backend_id  TEXT NOT NULL,
+            last_seen   INTEGER NOT NULL
         );
     """)
 
@@ -409,3 +419,96 @@ def tamper_message(
     con.commit()
     con.close()
     return modified
+
+
+# ============================================================
+# MULTI-NODE PRESENCE / ONLINE USERS
+# ============================================================
+
+def register_online_user(username: str, backend_id: str, db_path: str = DB_PATH) -> bool:
+    """Register or heartbeat an online user session across the cluster."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        res = _http_request(
+            f"{target_path.rstrip('/')}/users/heartbeat",
+            method="POST",
+            data={"username": username, "backend_id": backend_id},
+        )
+        return bool(res and res.get("status") == "success")
+
+    now = int(time.time())
+    con = get_db_connection(target_path)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO active_users (username, backend_id, last_seen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET backend_id = excluded.backend_id, last_seen = excluded.last_seen
+        """,
+        (username, backend_id, now),
+    )
+    con.commit()
+    con.close()
+    return True
+
+
+def remove_online_user(username: str, backend_id: str | None = None, db_path: str = DB_PATH) -> bool:
+    """Mark a user as offline across the cluster."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        res = _http_request(
+            f"{target_path.rstrip('/')}/users/offline",
+            method="POST",
+            data={"username": username, "backend_id": backend_id or ""},
+        )
+        return bool(res and res.get("status") == "success")
+
+    con = get_db_connection(target_path)
+    cur = con.cursor()
+    if backend_id:
+        cur.execute("DELETE FROM active_users WHERE username = ? AND backend_id = ?", (username, backend_id))
+    else:
+        cur.execute("DELETE FROM active_users WHERE username = ?", (username,))
+    con.commit()
+    con.close()
+    return True
+
+
+def clear_backend_users(backend_id: str, db_path: str = DB_PATH) -> bool:
+    """Clear all online users associated with a given backend node (e.g. upon node restart)."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        res = _http_request(
+            f"{target_path.rstrip('/')}/users/clear_backend",
+            method="POST",
+            data={"backend_id": backend_id},
+        )
+        return bool(res and res.get("status") == "success")
+
+    con = get_db_connection(target_path)
+    cur = con.cursor()
+    cur.execute("DELETE FROM active_users WHERE backend_id = ?", (backend_id,))
+    con.commit()
+    con.close()
+    return True
+
+
+def get_all_online_users(db_path: str = DB_PATH, prune_seconds: int = 60) -> list[dict]:
+    """Retrieve all currently active users across the cluster."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        res = _http_request(f"{target_path.rstrip('/')}/users", method="GET")
+        if res and "users" in res:
+            return res["users"]
+        return []
+
+    now = int(time.time())
+    con = get_db_connection(target_path)
+    cur = con.cursor()
+    cur.execute("DELETE FROM active_users WHERE (? - last_seen) > ?", (now, prune_seconds))
+    cur.execute("SELECT username, backend_id, last_seen FROM active_users ORDER BY username ASC")
+    rows = cur.fetchall()
+    con.commit()
+    con.close()
+    return [{"username": r[0], "backend_id": r[1], "last_seen": r[2]} for r in rows]
+

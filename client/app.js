@@ -1,16 +1,18 @@
 // Dynamically connect to the backend WebSocket server
-const SERVER_IP = window.location.hostname || "localhost";
-const SERVER_PORT = 4000;
-
-
+function getDefaultEndpoint() {
+    if (window.location.host && window.location.protocol.startsWith("http")) {
+        return window.location.host;
+    }
+    return "10.1.75.51:4214";
+}
 
 // ============================================================
 // VARIABLES
 // ============================================================
 
 let socket = null;
-
 let username = "";
+let activeEndpoint = getDefaultEndpoint();
 
 
 // ============================================================
@@ -32,6 +34,11 @@ const chatScreen =
 const usernameInput =
     document.getElementById(
         "username-input"
+    );
+
+const serverInput =
+    document.getElementById(
+        "server-input"
     );
 
 
@@ -89,6 +96,12 @@ const connectionText =
     );
 
 
+// Pre-fill server endpoint placeholder with default
+if (serverInput) {
+    serverInput.placeholder = `Endpoint (default: ${getDefaultEndpoint()})`;
+}
+
+
 // ============================================================
 // LOGIN
 // ============================================================
@@ -111,6 +124,21 @@ usernameInput.addEventListener(
 
     }
 );
+
+if (serverInput) {
+    serverInput.addEventListener(
+        "keydown",
+        function(event) {
+
+            if (event.key === "Enter") {
+
+                joinChat();
+
+            }
+
+        }
+    );
+}
 
 
 // ============================================================
@@ -136,13 +164,16 @@ function joinChat() {
 
     }
 
+    const endpoint = (serverInput && serverInput.value.trim()) || getDefaultEndpoint();
+    activeEndpoint = endpoint;
 
     loginError.textContent =
-        "Connecting...";
+        `Connecting to ${activeEndpoint}...`;
 
 
     connectToServer(
-        username
+        username,
+        activeEndpoint
     );
 }
 
@@ -152,22 +183,34 @@ function joinChat() {
 // ============================================================
 
 function connectToServer(
-    username
+    username,
+    targetEndpoint
 ) {
 
-    const url =
-        `ws://${SERVER_IP}:${SERVER_PORT}`;
+    if (socket) {
+        try {
+            socket.close();
+        } catch (e) {}
+    }
 
+    const cleanTarget = (targetEndpoint || getDefaultEndpoint()).replace(/^https?:\/\//, "").replace(/^wss?:\/\//, "").replace(/\/+$/, "");
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${protocol}//${cleanTarget}/ws`;
 
-    socket =
-        new WebSocket(url);
+    try {
+        socket = new WebSocket(url);
+    } catch (e) {
+        loginError.textContent = `Invalid endpoint: ${cleanTarget}`;
+        return;
+    }
 
 
     socket.onopen =
         function() {
 
             console.log(
-                "Connected to server"
+                "Connected to server:",
+                url
             );
 
 
@@ -191,13 +234,17 @@ function connectToServer(
     socket.onmessage =
         function(event) {
 
-            const data =
-                JSON.parse(
-                    event.data
-                );
+            try {
+                const data =
+                    JSON.parse(
+                        event.data
+                    );
 
 
-            handleServerMessage(data);
+                handleServerMessage(data, cleanTarget);
+            } catch (e) {
+                console.error("Message parse error:", e);
+            }
 
         };
 
@@ -206,12 +253,13 @@ function connectToServer(
         function() {
 
             console.log(
-                "Disconnected"
+                "Disconnected from server"
             );
 
 
             updateConnectionStatus(
-                false
+                false,
+                cleanTarget
             );
 
         };
@@ -225,6 +273,8 @@ function connectToServer(
                 error
             );
 
+            loginError.textContent = `Could not connect to ${cleanTarget}`;
+
         };
 
 }
@@ -234,7 +284,7 @@ function connectToServer(
 // HANDLE SERVER MESSAGE
 // ============================================================
 
-function handleServerMessage(data) {
+function handleServerMessage(data, endpoint) {
 
 
     // --------------------------------------------------------
@@ -257,7 +307,8 @@ function handleServerMessage(data) {
 
 
         updateConnectionStatus(
-            true
+            true,
+            endpoint
         );
 
 
@@ -301,6 +352,8 @@ function handleServerMessage(data) {
         "history"
     ) {
 
+        messages.innerHTML = "";
+
         // Show a top divider before history messages
         const topDivider =
             document.createElement("div");
@@ -318,8 +371,8 @@ function handleServerMessage(data) {
             function(msg) {
 
                 addMessage(
-                    msg.username,
-                    msg.message,
+                    msg.username || msg.sender || msg["client-name"] || msg["client_name"],
+                    msg.message || msg.msg,
                     msg.timestamp,
                     msg.verified,
                     true        // isHistory flag
@@ -376,8 +429,8 @@ function handleServerMessage(data) {
     ) {
 
         addMessage(
-            data.username,
-            data.message,
+            data.username || data.sender || data["client-name"] || data["client_name"],
+            data.message || data.msg,
             data.timestamp,
             data.verified,
             false           // not history
@@ -731,12 +784,11 @@ function updateUserList(
                 );
 
 
-            name.className =
-                "user-name";
-
-
-            name.textContent =
-                user.username;
+            if (user.backend_id) {
+                name.textContent = `${user.username} (${user.backend_id.replace("backend-", "node-")})`;
+            } else {
+                name.textContent = user.username;
+            }
 
 
             const dot =
@@ -779,7 +831,8 @@ function updateUserList(
 // ============================================================
 
 function updateConnectionStatus(
-    connected
+    connected,
+    endpoint
 ) {
 
     if (connected) {
@@ -790,7 +843,7 @@ function updateConnectionStatus(
 
 
         connectionText.textContent =
-            "Connected";
+            endpoint ? `Connected (${endpoint})` : "Connected";
 
     }
 
