@@ -147,6 +147,7 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
     """
     raw_records = load_history_raw(room_id=room_id, limit=limit, db_path=db_path)
     history = []
+    cached_pub_keys = {}
 
     for record in raw_records:
         msg_id = record["message_id"]
@@ -174,7 +175,9 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
                     message=plaintext,
                     timestamp=timestamp,
                 )
-                pub_bytes = key_manager.get_public_key_bytes(sender_id, db_path=db_path)
+                if sender_id not in cached_pub_keys:
+                    cached_pub_keys[sender_id] = key_manager.get_public_key_bytes(sender_id, db_path=db_path)
+                pub_bytes = cached_pub_keys[sender_id]
 
                 if pub_bytes and verify_signature(pub_bytes, canonical_payload, signature):
                     verified = True
@@ -664,6 +667,7 @@ async def cluster_sync_loop(app: web.Application):
                 try:
                     recent_raw = load_history_raw(ROOM_ID, limit=15, db_path=app_db_path)
                     new_records = [r for r in recent_raw if str(r["message_id"]) not in seen_message_ids]
+                    cached_sync_keys = {}
                     for r in new_records:
                         msg_id = str(r["message_id"])
                         seen_message_ids.add(msg_id)
@@ -690,7 +694,9 @@ async def cluster_sync_loop(app: web.Application):
                                     message=plaintext,
                                     timestamp=timestamp,
                                 )
-                                pub_bytes = key_manager.get_public_key_bytes(sender_id, db_path=app_db_path)
+                                if sender_id not in cached_sync_keys:
+                                    cached_sync_keys[sender_id] = key_manager.get_public_key_bytes(sender_id, db_path=app_db_path)
+                                pub_bytes = cached_sync_keys[sender_id]
                                 if pub_bytes and verify_signature(pub_bytes, canonical_payload, r["signature"]):
                                     verified = True
                             except Exception:

@@ -213,6 +213,38 @@ class TestLiveMultiBackend(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNotNone(leave_event, "Bob on Node 3 did not receive real-time leave event for Alice")
 
+    async def test_cross_backend_signature_verification_with_stale_cache(self):
+        """
+        Verify that even if a node has a stale in-memory keypair for a user,
+        it uses the canonical public key from the database and correctly
+        verifies messages sent from another node as verified=True (Green checkmark).
+        """
+        b2_url = f"http://127.0.0.1:{self.ports[0]}"
+        b3_url = f"http://127.0.0.1:{self.ports[1]}"
+
+        # Simulate stale in-memory key on Node 3
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        server.key_manager._memory_private_keys["gopi"] = Ed25519PrivateKey.generate()
+
+        # Now send a message as gopi on Node 2
+        payload = {
+            "client-name": "gopi",
+            "msg": "Hello ganesh from node 2",
+            "message_id": "GOPI-MSG-001",
+        }
+        async with self.session.post(f"{b2_url}/message", json=payload) as resp:
+            self.assertEqual(resp.status, 201)
+
+        # Now fetch feed from Node 3
+        async with self.session.get(f"{b3_url}/feed") as resp:
+            self.assertEqual(resp.status, 200)
+            data = await resp.json()
+            matching = [m for m in data["messages"] if m["message_id"] == "GOPI-MSG-001"]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0]["msg"], "Hello ganesh from node 2")
+            # Must be verified=True despite Node 3's stale in-memory key!
+            self.assertTrue(matching[0]["verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

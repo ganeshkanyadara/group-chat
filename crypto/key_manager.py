@@ -13,7 +13,8 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from database import save_public_key, load_public_key
 
-KEYS_DIR = Path(os.getenv("KEYS_DIR", "keys"))
+DEFAULT_KEYS_DIR = Path(__file__).resolve().parent.parent / "keys"
+KEYS_DIR = Path(os.getenv("KEYS_DIR", str(DEFAULT_KEYS_DIR)))
 
 
 class KeyManager:
@@ -40,26 +41,25 @@ class KeyManager:
         Syncs the corresponding public key to database.
         Returns (private_key, public_key_raw_bytes).
         """
+        key_path = self.get_private_key_path(username)
         if username in self._memory_private_keys:
             private_key = self._memory_private_keys[username]
+        elif key_path.exists():
+            pem_data = key_path.read_bytes()
+            private_key = load_pem_private_key(pem_data, password=None)
+            self._memory_private_keys[username] = private_key
         else:
-            key_path = self.get_private_key_path(username)
-            if key_path.exists():
-                pem_data = key_path.read_bytes()
-                private_key = load_pem_private_key(pem_data, password=None)
-            else:
-                private_key = Ed25519PrivateKey.generate()
-                pem_bytes = private_key.private_bytes(
-                    Encoding.PEM,
-                    PrivateFormat.PKCS8,
-                    NoEncryption(),
-                )
-                key_path.write_bytes(pem_bytes)
-                try:
-                    os.chmod(key_path, 0o600)
-                except Exception:
-                    pass
-
+            private_key = Ed25519PrivateKey.generate()
+            pem_bytes = private_key.private_bytes(
+                Encoding.PEM,
+                PrivateFormat.PKCS8,
+                NoEncryption(),
+            )
+            key_path.write_bytes(pem_bytes)
+            try:
+                os.chmod(key_path, 0o600)
+            except Exception:
+                pass
             self._memory_private_keys[username] = private_key
 
         public_key = private_key.public_key()
@@ -75,17 +75,38 @@ class KeyManager:
         return private_key, pub_bytes
 
     def get_public_key_bytes(self, username: str, db_path: str = None) -> bytes | None:
-        """Fetch raw public key bytes from memory, disk, or SQLite."""
+        """
+        Fetch raw public key bytes for signature verification.
+        Always queries the shared database first (canonical source of truth for the cluster),
+        falling back to local memory and disk only if the DB is unreachable or empty.
+        """
         target_db = db_path or self.db_path
 
-        # If we have it locally, verify it against DB or return it
+        # 1. Fetch from shared database first (canonical source of truth for the cluster)
+        if target_db:
+            try:
+                db_pub = load_public_key(username, db_path=target_db)
+                if db_pub:
+                    return db_pub
+            except Exception:
+                pass
+
+        # 2. Fall back to local memory if DB has no record or is unreachable
         if username in self._memory_private_keys:
             pub = self._memory_private_keys[username].public_key()
             return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
-        if target_db:
-            return load_public_key(username, db_path=target_db)
-        return load_public_key(username)
+        # 3. Fall back to local disk
+        key_path = self.get_private_key_path(username)
+        if key_path.exists():
+            try:
+                pem_data = key_path.read_bytes()
+                priv = load_pem_private_key(pem_data, password=None)
+                return priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            except Exception:
+                pass
+
+        return None
 
     def initialize_keys_for_users(self, usernames: list[str]) -> None:
         """Pre-initialize key pairs for a list of authorized usernames."""
