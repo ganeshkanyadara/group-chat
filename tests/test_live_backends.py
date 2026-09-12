@@ -245,6 +245,48 @@ class TestLiveMultiBackend(unittest.IsolatedAsyncioTestCase):
             # Must be verified=True despite Node 3's stale in-memory key!
             self.assertTrue(matching[0]["verified"])
 
+    async def test_disallow_duplicate_usernames_local_and_cluster(self):
+        """
+        Verify that duplicate usernames are rejected:
+        1. On the same node (local check).
+        2. Across different nodes in the cluster (cluster check).
+        3. Once the user leaves, the username becomes available again.
+        """
+        ws2_url = f"http://127.0.0.1:{self.ports[0]}/"
+        ws3_url = f"http://127.0.0.1:{self.ports[1]}/"
+
+        # 1. User charlie connects to Node 2
+        ws_charlie = await self.session.ws_connect(ws2_url)
+        await ws_charlie.send_json({"type": "join", "username": "charlie"})
+        msg = await ws_charlie.receive_json()
+        self.assertEqual(msg["type"], "authenticated")
+
+        # 2. Duplicate on same node (Node 2)
+        async with self.session.ws_connect(ws2_url) as ws_dup1:
+            await ws_dup1.send_json({"type": "join", "username": "charlie"})
+            err_msg = await ws_dup1.receive_json()
+            self.assertEqual(err_msg["type"], "error")
+            self.assertEqual(err_msg.get("error_code"), "DUPLICATE_USERNAME")
+            self.assertIn("already taken", err_msg["message"])
+
+        # 3. Duplicate on different node in the cluster (Node 3)
+        async with self.session.ws_connect(ws3_url) as ws_dup2:
+            await ws_dup2.send_json({"type": "join", "username": "charlie"})
+            err_msg = await ws_dup2.receive_json()
+            self.assertEqual(err_msg["type"], "error")
+            self.assertEqual(err_msg.get("error_code"), "DUPLICATE_USERNAME")
+            self.assertIn("already taken", err_msg["message"])
+
+        # 4. Charlie leaves Node 2
+        await ws_charlie.close()
+        await asyncio.sleep(0.2)
+
+        # 5. Now another user can use charlie on Node 3
+        async with self.session.ws_connect(ws3_url) as ws_charlie_new:
+            await ws_charlie_new.send_json({"type": "join", "username": "charlie"})
+            msg = await ws_charlie_new.receive_json()
+            self.assertEqual(msg["type"], "authenticated")
+
 
 if __name__ == "__main__":
     unittest.main()

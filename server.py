@@ -463,23 +463,48 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
 
         requested_name = str(auth_data.get("username", "")).strip()
         if not requested_name:
-            import random
-            requested_name = f"Guest_{random.randint(1000, 9999)}"
+            await send_json(ws, {"type": "error", "message": "Username cannot be empty."})
+            await ws.close()
+            return ws
 
-        username = requested_name
-        counter = 1
-        while any(user["username"] == username for user in connected_users.values()):
-            username = f"{requested_name}_{counter}"
-            counter += 1
-
-        if len(connected_users) >= MAX_USERS:
-            await send_json(ws, {"type": "error", "message": f"Chat room full. Maximum {MAX_USERS} users allowed."})
+        if len(requested_name) > 30:
+            await send_json(ws, {"type": "error", "message": "Username cannot exceed 30 characters."})
             await ws.close()
             return ws
 
         app = request.app
         app_backend_id = get_app_backend_id(app)
         app_db_path = get_app_db_path(app)
+
+        # Disallow duplicate usernames locally and across the cluster
+        is_duplicate = any(user["username"].lower() == requested_name.lower() for user in connected_users.values())
+        if not is_duplicate:
+            try:
+                cluster_users = get_all_online_users(db_path=app_db_path, prune_seconds=30)
+                if cluster_users:
+                    is_duplicate = any(
+                        str(u.get("username", "")).strip().lower() == requested_name.lower()
+                        for u in cluster_users
+                    )
+            except Exception:
+                pass
+
+        if is_duplicate:
+            print(f"[{app_backend_id}] [REJECT] Duplicate username attempt: '{requested_name}' from {ip}")
+            await send_json(ws, {
+                "type": "error",
+                "error_code": "DUPLICATE_USERNAME",
+                "message": f"Username '{requested_name}' is already taken. Please choose a different username."
+            })
+            await ws.close()
+            return ws
+
+        username = requested_name
+
+        if len(connected_users) >= MAX_USERS:
+            await send_json(ws, {"type": "error", "message": f"Chat room full. Maximum {MAX_USERS} users allowed."})
+            await ws.close()
+            return ws
 
         # 1. Register presence in shared cluster database
         try:

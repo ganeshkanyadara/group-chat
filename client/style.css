@@ -154,6 +154,14 @@ body {
         rgba(20, 184, 166, 0.12);
 }
 
+.login-card input.input-error {
+    border-color: #dc2626 !important;
+    background-color: #fef2f2 !important;
+    box-shadow:
+        0 0 0 3px
+        rgba(220, 38, 38, 0.15) !important;
+}
+
 
 /* Join button */
 

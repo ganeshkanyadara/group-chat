@@ -141,40 +141,42 @@ if (serverInput) {
 }
 
 
+// Flag to prevent socket.onerror/onclose from wiping out duplicate username or auth error messages
+let hasExplicitAuthError = false;
+
+// Clear input error on typing
+if (usernameInput) {
+    usernameInput.addEventListener("input", function() {
+        usernameInput.classList.remove("input-error");
+        if (loginError.textContent && !loginError.textContent.startsWith("Connecting")) {
+            loginError.textContent = "";
+        }
+    });
+}
+
 // ============================================================
 // JOIN CHAT
 // ============================================================
 
 function joinChat() {
-
-    username =
-        usernameInput.value.trim();
-
+    username = usernameInput.value.trim();
 
     if (!username) {
-
-        const randomNum =
-            Math.floor(1000 + Math.random() * 9000);
-
-        username =
-            `Guest_${randomNum}`;
-
-        usernameInput.value =
-            username;
-
+        usernameInput.classList.add("input-error");
+        loginError.textContent = "Please enter a username.";
+        usernameInput.focus();
+        return;
     }
 
+    usernameInput.classList.remove("input-error");
     const endpoint = (serverInput && serverInput.value.trim()) || getDefaultEndpoint();
     activeEndpoint = endpoint;
 
-    loginError.textContent =
-        `Connecting to ${activeEndpoint}...`;
+    loginError.textContent = `Connecting to ${activeEndpoint}...`;
+    joinButton.disabled = true;
+    joinButton.textContent = "Connecting...";
 
-
-    connectToServer(
-        username,
-        activeEndpoint
-    );
+    connectToServer(username, activeEndpoint);
 }
 
 
@@ -186,6 +188,7 @@ function connectToServer(
     username,
     targetEndpoint
 ) {
+    hasExplicitAuthError = false;
 
     if (socket) {
         try {
@@ -201,80 +204,56 @@ function connectToServer(
         socket = new WebSocket(url);
     } catch (e) {
         loginError.textContent = `Invalid endpoint: ${cleanTarget}`;
+        joinButton.disabled = false;
+        joinButton.textContent = "Join Chat";
         return;
     }
 
 
     socket.onopen =
         function() {
-
-            console.log(
-                "Connected to server:",
-                url
-            );
-
-
-            // Send join request
-
+            console.log("Connected to server:", url);
             socket.send(
                 JSON.stringify({
-
-                    type:
-                        "authenticate",
-
-                    username:
-                        username
-
+                    type: "authenticate",
+                    username: username
                 })
             );
-
         };
 
 
     socket.onmessage =
         function(event) {
-
             try {
-                const data =
-                    JSON.parse(
-                        event.data
-                    );
-
-
+                const data = JSON.parse(event.data);
                 handleServerMessage(data, cleanTarget);
             } catch (e) {
                 console.error("Message parse error:", e);
             }
-
         };
 
 
     socket.onclose =
         function() {
-
-            console.log(
-                "Disconnected from server"
-            );
-
-
-            updateConnectionStatus(
-                false,
-                cleanTarget
-            );
-
+            console.log("Disconnected from server");
+            if (hasExplicitAuthError) {
+                joinButton.disabled = false;
+                joinButton.textContent = "Join Chat";
+                return;
+            }
+            updateConnectionStatus(false, cleanTarget);
+            joinButton.disabled = false;
+            joinButton.textContent = "Join Chat";
         };
 
 
     socket.onerror =
         function(error) {
-
-            console.error(
-                "WebSocket error:",
-                error
-            );
-
+            console.error("WebSocket error:", error);
+            if (hasExplicitAuthError) return;
             loginError.textContent = `Could not connect to ${cleanTarget}`;
-
+            joinButton.disabled = false;
+            joinButton.textContent = "Join Chat";
         };
 
 }
@@ -286,59 +265,41 @@ function connectToServer(
 
 function handleServerMessage(data, endpoint) {
 
-
     // --------------------------------------------------------
     // Authentication successful
     // --------------------------------------------------------
+    if (data.type === "authenticated") {
+        hasExplicitAuthError = false;
+        loginError.textContent = "";
+        usernameInput.classList.remove("input-error");
+        joinButton.disabled = false;
+        joinButton.textContent = "Join Chat";
 
-    if (
-        data.type ===
-        "authenticated"
-    ) {
+        loginScreen.classList.add("hidden");
+        chatScreen.classList.remove("hidden");
 
-        loginScreen.classList.add(
-            "hidden"
-        );
-
-
-        chatScreen.classList.remove(
-            "hidden"
-        );
-
-
-        updateConnectionStatus(
-            true,
-            endpoint
-        );
-
-
+        updateConnectionStatus(true, endpoint);
         messageInput.focus();
-
-
         return;
     }
 
-
     // --------------------------------------------------------
-    // Authentication / server error
+    // Authentication / server error (e.g. Duplicate Username)
     // --------------------------------------------------------
-
-    if (
-        data.type ===
-        "error"
-    ) {
-
-        loginError.textContent =
-            data.message;
-
+    if (data.type === "error") {
+        hasExplicitAuthError = true;
+        loginError.textContent = data.message;
+        usernameInput.classList.add("input-error");
+        usernameInput.focus();
+        usernameInput.select();
+        joinButton.disabled = false;
+        joinButton.textContent = "Join Chat";
 
         if (socket) {
-
-            socket.close();
-
+            try {
+                socket.close();
+            } catch (e) {}
         }
-
-
         return;
     }
 
