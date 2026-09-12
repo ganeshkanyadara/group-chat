@@ -143,6 +143,76 @@ class TestLiveMultiBackend(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("avg_latency_ms", data)
                 self.assertIn("uptime_seconds", data)
 
+    async def test_realtime_cross_backend_websocket_sync(self):
+        """
+        Verify real-time message sync across separate backend instances via WebSockets.
+        Client A connects to Node 2 (8101).
+        Client B connects to Node 3 (8102).
+        Client A sends a message -> Client B must receive it in real time over WS.
+        """
+        import json
+
+        ws2_url = f"http://127.0.0.1:{self.ports[0]}/"
+        ws3_url = f"http://127.0.0.1:{self.ports[1]}/"
+
+        async with self.session.ws_connect(ws2_url) as ws2, \
+                   self.session.ws_connect(ws3_url) as ws3:
+
+            async def read_until_type(ws, target_type, timeout=3.0):
+                start = asyncio.get_event_loop().time()
+                while asyncio.get_event_loop().time() - start < timeout:
+                    msg = await asyncio.wait_for(ws.receive_json(), timeout=timeout)
+                    if msg.get("type") == target_type:
+                        return msg
+                return None
+
+            # Join Node 2
+            await ws2.send_json({"type": "join", "username": "alice_node2"})
+            auth2 = await read_until_type(ws2, "authenticated")
+            self.assertIsNotNone(auth2)
+
+            # Join Node 3
+            await ws3.send_json({"type": "join", "username": "bob_node3"})
+            auth3 = await read_until_type(ws3, "authenticated")
+            self.assertIsNotNone(auth3)
+
+            # Alice on Node 2 sends a message
+            await ws2.send_json({
+                "type": "message",
+                "message": "Hello from Node 2 in real time!",
+                "message_id": "WS-REALTIME-999",
+            })
+
+            # Alice receives her own broadcast
+            local_echo = await read_until_type(ws2, "message")
+            self.assertIsNotNone(local_echo)
+            self.assertEqual(local_echo["message"], "Hello from Node 2 in real time!")
+
+            # Bob on Node 3 MUST receive Alice's message in real time via the sync loop!
+            bob_msg = await read_until_type(ws3, "message", timeout=3.0)
+            self.assertIsNotNone(bob_msg, "Bob on Node 3 did not receive Alice's real-time message from Node 2")
+            self.assertEqual(bob_msg["username"], "alice_node2")
+            self.assertEqual(bob_msg["message"], "Hello from Node 2 in real time!")
+            self.assertEqual(bob_msg["message_id"], local_echo["message_id"])
+            self.assertTrue(bob_msg.get("verified"))
+
+            # Now Alice on Node 2 leaves (closes WebSocket)
+            await ws2.close()
+
+            # Bob on Node 3 should receive system notification that alice_node2 left the chat!
+            leave_event = None
+            start = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - start < 3.0:
+                try:
+                    msg = await asyncio.wait_for(ws3.receive_json(), timeout=1.0)
+                    if msg.get("type") == "system" and "alice_node2 left" in msg.get("message", ""):
+                        leave_event = msg
+                        break
+                except asyncio.TimeoutError:
+                    break
+
+            self.assertIsNotNone(leave_event, "Bob on Node 3 did not receive real-time leave event for Alice")
+
 
 if __name__ == "__main__":
     unittest.main()

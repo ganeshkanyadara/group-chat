@@ -37,6 +37,8 @@ from database import (
     remove_online_user,
     clear_backend_users,
     get_all_online_users,
+    record_cluster_event,
+    get_cluster_events,
     DB_PATH,
     get_db_path,
 )
@@ -75,6 +77,12 @@ def get_app_db_path(app: web.Application) -> str:
 
 # State tracking: websocket connection -> user info dict
 connected_users = {}
+
+# Set of known message IDs to prevent duplicate broadcasts
+seen_message_ids = set()
+
+# Last event ID seen from cluster_events
+last_cluster_event_id = 0
 
 # Key Manager instance
 key_manager = KeyManager(db_path=DB_PATH)
@@ -320,15 +328,17 @@ async def post_message_handler(request: web.Request) -> web.Response:
         )
 
         # 4. Broadcast to local WebSocket clients if newly created
-        if was_created and connected_users:
-            asyncio.create_task(broadcast({
-                "type": "message",
-                "message_id": persisted_id,
-                "username": client_name,
-                "message": msg_text,
-                "timestamp": timestamp,
-                "verified": True,
-            }))
+        if was_created:
+            seen_message_ids.add(str(persisted_id))
+            if connected_users:
+                asyncio.create_task(broadcast({
+                    "type": "message",
+                    "message_id": persisted_id,
+                    "username": client_name,
+                    "message": msg_text,
+                    "timestamp": timestamp,
+                    "verified": True,
+                }))
 
         return web.json_response(
             {
@@ -493,6 +503,11 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                 "messages": history_messages,
             })
 
+        try:
+            record_cluster_event("system", f"{username} joined the chat", sender_node=app_backend_id, db_path=app_db_path)
+        except Exception:
+            pass
+
         await broadcast({"type": "system", "message": f"{username} joined the chat"})
         await send_user_list(app)
 
@@ -535,6 +550,8 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     db_path=app_db_path,
                 )
 
+                seen_message_ids.add(str(msg_id))
+
                 await broadcast({
                     "type": "message",
                     "message_id": msg_id,
@@ -552,9 +569,13 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         if ws in connected_users:
             user_info = connected_users.pop(ws)
             left_user = user_info["username"]
-            print(f"[{BACKEND_ID}] [LEAVE] {left_user} disconnected | Online: {len(connected_users)}/{MAX_USERS}")
+            print(f"[{app_backend_id}] [LEAVE] {left_user} disconnected | Online: {len(connected_users)}/{MAX_USERS}")
             try:
                 remove_online_user(left_user, app_backend_id, db_path=app_db_path)
+            except Exception:
+                pass
+            try:
+                record_cluster_event("system", f"{left_user} left the chat", sender_node=app_backend_id, db_path=app_db_path)
             except Exception:
                 pass
             await broadcast({"type": "system", "message": f"{left_user} left the chat"})
@@ -611,37 +632,117 @@ async def index_or_ws_handler(request: web.Request) -> web.StreamResponse:
     })
 
 
-async def presence_background_loop(app: web.Application):
-    """Periodically heartbeat locally connected users and broadcast updated cluster user list."""
+async def cluster_sync_loop(app: web.Application):
+    """
+    Real-time cross-node sync loop:
+    1. Synchronizes messages across all nodes via the shared DB in real time.
+    2. Synchronizes join/leave events across all nodes via cluster events.
+    3. Heartbeats local users and updates the combined online user list.
+    """
+    global last_cluster_event_id
     app_backend_id = get_app_backend_id(app)
     app_db_path = get_app_db_path(app)
     last_users_json = ""
+    heartbeat_counter = 0
+
+    # Pre-populate seen_message_ids from DB on startup so we don't re-broadcast history
+    try:
+        init_history = load_history_raw(ROOM_ID, limit=100, db_path=app_db_path)
+        for r in init_history:
+            seen_message_ids.add(str(r["message_id"]))
+    except Exception:
+        pass
+
     try:
         while True:
-            await asyncio.sleep(4.0)
-            # 1. Heartbeat local active connections
-            local_users = [u["username"] for u in list(connected_users.values())]
-            for u in local_users:
+            await asyncio.sleep(0.4)
+            heartbeat_counter += 1
+
+            # A. REAL-TIME CROSS-NODE MESSAGE SYNC
+            # If this instance has connected WebSocket clients, poll for new messages from other nodes
+            if connected_users:
                 try:
-                    register_online_user(u, app_backend_id, db_path=app_db_path)
+                    recent_raw = load_history_raw(ROOM_ID, limit=15, db_path=app_db_path)
+                    new_records = [r for r in recent_raw if str(r["message_id"]) not in seen_message_ids]
+                    for r in new_records:
+                        msg_id = str(r["message_id"])
+                        seen_message_ids.add(msg_id)
+                        if len(seen_message_ids) > 2000:
+                            seen_message_ids.clear()
+                            for rec in recent_raw:
+                                seen_message_ids.add(str(rec["message_id"]))
+
+                        sender_id = r["sender_id"]
+                        timestamp = r["timestamp"]
+                        try:
+                            plaintext = decrypt_message(r["ciphertext"], r["nonce"])
+                            decrypted_ok = True
+                        except Exception:
+                            plaintext = "[message could not be decrypted - ciphertext tampered or key mismatch]"
+                            decrypted_ok = False
+
+                        verified = False
+                        if decrypted_ok:
+                            try:
+                                canonical_payload = construct_canonical_payload(
+                                    room_id=ROOM_ID,
+                                    sender_id=sender_id,
+                                    message=plaintext,
+                                    timestamp=timestamp,
+                                )
+                                pub_bytes = key_manager.get_public_key_bytes(sender_id, db_path=app_db_path)
+                                if pub_bytes and verify_signature(pub_bytes, canonical_payload, r["signature"]):
+                                    verified = True
+                            except Exception:
+                                verified = False
+
+                        await broadcast({
+                            "type": "message",
+                            "message_id": msg_id,
+                            "username": sender_id,
+                            "message": plaintext,
+                            "timestamp": timestamp,
+                            "verified": verified,
+                        })
                 except Exception:
                     pass
-            # 2. Fetch cluster-wide online users and broadcast if changed
+
+            # B. REAL-TIME CROSS-NODE SYSTEM EVENTS (join / leave)
             try:
-                cluster_users = get_all_online_users(db_path=app_db_path)
-                if cluster_users is not None:
-                    current_json = json.dumps([{"u": x.get("username"), "b": x.get("backend_id")} for x in cluster_users], sort_keys=True)
-                    if current_json != last_users_json:
-                        last_users_json = current_json
-                        await broadcast({"type": "user_list", "users": cluster_users})
+                events = get_cluster_events(since_id=last_cluster_event_id, db_path=app_db_path)
+                for ev in events:
+                    if ev["id"] > last_cluster_event_id:
+                        last_cluster_event_id = ev["id"]
+                    # Only broadcast events originating from other nodes
+                    if ev.get("sender_node") != app_backend_id:
+                        await broadcast({"type": "system", "message": ev["message"]})
             except Exception:
                 pass
+
+            # C. PERIODIC PRESENCE & HEARTBEAT (every ~2 seconds)
+            if heartbeat_counter >= 5:
+                heartbeat_counter = 0
+                local_users = [u["username"] for u in list(connected_users.values())]
+                for u in local_users:
+                    try:
+                        register_online_user(u, app_backend_id, db_path=app_db_path)
+                    except Exception:
+                        pass
+                try:
+                    cluster_users = get_all_online_users(db_path=app_db_path)
+                    if cluster_users is not None:
+                        current_json = json.dumps([{"u": x.get("username"), "b": x.get("backend_id")} for x in cluster_users], sort_keys=True)
+                        if current_json != last_users_json:
+                            last_users_json = current_json
+                            await broadcast({"type": "user_list", "users": cluster_users})
+                except Exception:
+                    pass
     except asyncio.CancelledError:
         pass
 
 
 async def start_background_tasks(app: web.Application):
-    """Startup and cleanup context for presence synchronization and heartbeat."""
+    """Startup and cleanup context for cluster sync loop, presence, and heartbeat."""
     app_backend_id = get_app_backend_id(app)
     app_db_path = get_app_db_path(app)
     try:
@@ -649,7 +750,7 @@ async def start_background_tasks(app: web.Application):
     except Exception:
         pass
 
-    task = asyncio.create_task(presence_background_loop(app))
+    task = asyncio.create_task(cluster_sync_loop(app))
     yield
     task.cancel()
     try:

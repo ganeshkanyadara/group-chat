@@ -3,7 +3,7 @@ function getDefaultEndpoint() {
     if (window.location.host && window.location.protocol.startsWith("http")) {
         return window.location.host;
     }
-    return "10.1.75.51:4214";
+    return "10.1.75.51:4215";
 }
 
 // ============================================================

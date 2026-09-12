@@ -16,6 +16,8 @@ from .database import (
     remove_online_user,
     clear_backend_users,
     get_all_online_users,
+    record_cluster_event,
+    get_cluster_events,
     DB_PATH,
 )
 
@@ -34,6 +36,8 @@ __all__ = [
     "remove_online_user",
     "clear_backend_users",
     "get_all_online_users",
+    "record_cluster_event",
+    "get_cluster_events",
     "DB_PATH",
 ]
 

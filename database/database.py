@@ -152,6 +152,17 @@ def init_db(db_path: str = DB_PATH) -> None:
         );
     """)
 
+    # Table storing multi-node cluster events (join/leave/system broadcasts)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS system_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type  TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            sender_node TEXT NOT NULL,
+            timestamp   INTEGER NOT NULL
+        );
+    """)
+
     con.commit()
     con.close()
 
@@ -514,4 +525,60 @@ def get_all_online_users(db_path: str = DB_PATH, prune_seconds: int = 60) -> lis
     con.commit()
     con.close()
     return [{"username": r[0], "backend_id": r[1], "last_seen": r[2]} for r in rows]
+
+
+def record_cluster_event(event_type: str, message: str, sender_node: str, db_path: str = DB_PATH) -> bool:
+    """Record a system/presence event in the shared database so other nodes receive it."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        try:
+            res = _http_request(
+                f"{target_path.rstrip('/')}/events",
+                method="POST",
+                data={"event_type": event_type, "message": message, "sender_node": sender_node},
+            )
+            return bool(res and res.get("status") == "success")
+        except Exception:
+            return False
+
+    now = int(time.time())
+    try:
+        con = get_db_connection(target_path)
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO system_events (event_type, message, sender_node, timestamp) VALUES (?, ?, ?, ?)",
+            (event_type, message, sender_node, now),
+        )
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def get_cluster_events(since_id: int, db_path: str = DB_PATH) -> list[dict]:
+    """Retrieve new cluster events since the given event ID."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        try:
+            res = _http_request(f"{target_path.rstrip('/')}/events?since_id={since_id}", method="GET")
+            if res and res.get("status") == "success" and "events" in res:
+                return res["events"]
+        except Exception:
+            pass
+        return []
+
+    try:
+        con = get_db_connection(target_path)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT id, event_type, message, sender_node, timestamp FROM system_events WHERE id > ? ORDER BY id ASC LIMIT 50",
+            (since_id,),
+        )
+        rows = cur.fetchall()
+        con.close()
+        return [{"id": r[0], "event_type": r[1], "message": r[2], "sender_node": r[3], "timestamp": r[4]} for r in rows]
+    except Exception:
+        return []
+
 
