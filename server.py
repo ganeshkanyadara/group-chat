@@ -7,6 +7,26 @@ import uuid
 from datetime import datetime, timezone
 from aiohttp import web, WSMsgType
 
+# Automatically load .env file if present (even without python-dotenv package)
+def _load_env():
+    for base in [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]:
+        env_file = os.path.join(base, ".env")
+        if os.path.exists(env_file):
+            try:
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+_load_env()
+
 from database import (
     init_db,
     store_message,
@@ -134,7 +154,7 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
                     message=plaintext,
                     timestamp=timestamp,
                 )
-                pub_bytes = key_manager.get_public_key_bytes(sender_id)
+                pub_bytes = key_manager.get_public_key_bytes(sender_id, db_path=db_path)
 
                 if pub_bytes and verify_signature(pub_bytes, canonical_payload, signature):
                     verified = True
@@ -262,7 +282,7 @@ async def post_message_handler(request: web.Request) -> web.Response:
 
     try:
         # 1. Asymmetric keypair & Digital Signature
-        user_priv_key, _ = key_manager.get_or_create_user_keypair(client_name)
+        user_priv_key, _ = key_manager.get_or_create_user_keypair(client_name, db_path=db_path)
         canonical_payload = construct_canonical_payload(
             room_id=ROOM_ID,
             sender_id=client_name,

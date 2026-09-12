@@ -34,7 +34,7 @@ class KeyManager:
     def get_private_key_path(self, username: str) -> Path:
         return self.keys_dir / f"{username}_private.pem"
 
-    def get_or_create_user_keypair(self, username: str) -> tuple[Ed25519PrivateKey, bytes]:
+    def get_or_create_user_keypair(self, username: str, db_path: str = None) -> tuple[Ed25519PrivateKey, bytes]:
         """
         Load or generate Ed25519 private key for username.
         Syncs the corresponding public key to database.
@@ -66,21 +66,25 @@ class KeyManager:
         pub_bytes = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
         # Sync public key to database
-        if self.db_path:
-            save_public_key(username, pub_bytes, db_path=self.db_path)
+        target_db = db_path or self.db_path
+        if target_db:
+            save_public_key(username, pub_bytes, db_path=target_db)
         else:
             save_public_key(username, pub_bytes)
 
         return private_key, pub_bytes
 
-    def get_public_key_bytes(self, username: str) -> bytes | None:
+    def get_public_key_bytes(self, username: str, db_path: str = None) -> bytes | None:
         """Fetch raw public key bytes from memory, disk, or SQLite."""
+        target_db = db_path or self.db_path
+
+        # If we have it locally, verify it against DB or return it
         if username in self._memory_private_keys:
             pub = self._memory_private_keys[username].public_key()
             return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
-        if self.db_path:
-            return load_public_key(username, db_path=self.db_path)
+        if target_db:
+            return load_public_key(username, db_path=target_db)
         return load_public_key(username)
 
     def initialize_keys_for_users(self, usernames: list[str]) -> None:
