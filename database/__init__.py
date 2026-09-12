@@ -9,6 +9,9 @@ from .database import (
     load_public_key,
     get_message_by_id,
     tamper_message,
+    check_db_health,
+    get_db_connection,
+    get_db_path,
     DB_PATH,
 )
 
@@ -20,5 +23,9 @@ __all__ = [
     "load_public_key",
     "get_message_by_id",
     "tamper_message",
+    "check_db_health",
+    "get_db_connection",
+    "get_db_path",
     "DB_PATH",
 ]
+

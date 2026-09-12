@@ -289,3 +289,224 @@ python3 -m unittest discover -s tests
 - `test_6_tampering_detection`: Detection of corrupted ciphertext or signature bytes.
 - `test_7_unauthorized_user`: Rejection of non-authorized usernames.
 - `test_8_multiple_users`: Multi-user key isolation and signing for all 4 group members.
+
+---
+
+## Running Multiple Backend Instances
+
+This backend is designed to run concurrently across multiple physical or virtual hosts (Systems 2, 3, and 4) behind a Dynamic Load Balancer (System 1), all sharing a single persistent database.
+
+```text
+               Load Generator / Clients
+                          │
+                          ▼
+            System 1: Go Load Balancer
+                          │
+         ┌────────────────┼────────────────┐
+         │                │                │
+         ▼                ▼                ▼
+     System 2         System 3         System 4
+  Backend Instance 1  Backend Instance 2  Backend Instance 3
+  (BACKEND_ID=b-1)  (BACKEND_ID=b-2)  (BACKEND_ID=b-3)
+         │                │                │
+         └────────────────┼────────────────┘
+                          │
+                          ▼
+               Shared Persistent SQLite
+                  (chat.db with WAL)
+```
+
+### 1. Configuration & Environment Variables
+
+Configure each backend using environment variables or a `.env` file:
+
+| Variable | Description | Example / Default |
+|---|---|---|
+| `BACKEND_ID` | Unique identifier for this physical/virtual backend | `backend-1` (Sys 2), `backend-2` (Sys 3), `backend-3` (Sys 4) |
+| `BACKEND_HOST` | Network interface IP to bind to | `0.0.0.0` |
+| `BACKEND_PORT` | Port for HTTP & WebSocket listeners | `4000` (or `8001`) |
+| `DATABASE_URL` | Path to the shared SQLite database file | `/mnt/shared/chat.db` or `sqlite:///mnt/shared/chat.db` |
+| `CHAT_DB_PATH` | Fallback database path if `DATABASE_URL` not set | `chat.db` |
+| `CHAT_ENCRYPTION_KEY`| 32-byte AES key for at-rest message encryption | 64-char hex string |
+
+> [!IMPORTANT]
+> **Shared Database Setup:** Ensure Systems 2, 3, and 4 mount the same directory or share the SQLite database file (e.g., via NFS, SSHFS, or shared volume). SQLite automatically uses Write-Ahead Logging (`WAL` mode) and 30-second busy timeouts to safely coordinate concurrent transactions across multiple instances.
+
+---
+
+### 2. Starting the Backend on Each System
+
+#### System 2 (Backend Instance 1)
+```bash
+export BACKEND_ID="backend-1"
+export BACKEND_HOST="0.0.0.0"
+export BACKEND_PORT=4000
+export DATABASE_URL="/mnt/shared/chat.db"
+export CHAT_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+python3 server.py
+```
+
+#### System 3 (Backend Instance 2)
+```bash
+export BACKEND_ID="backend-2"
+export BACKEND_HOST="0.0.0.0"
+export BACKEND_PORT=4000
+export DATABASE_URL="/mnt/shared/chat.db"
+export CHAT_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+python3 server.py
+```
+
+#### System 4 (Backend Instance 3)
+```bash
+export BACKEND_ID="backend-3"
+export BACKEND_HOST="0.0.0.0"
+export BACKEND_PORT=4000
+export DATABASE_URL="/mnt/shared/chat.db"
+export CHAT_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+python3 server.py
+```
+
+---
+
+### 3. API Verification with `curl`
+
+Replace `SYSTEM2_IP`, `SYSTEM3_IP`, `SYSTEM4_IP` with the respective host addresses (port `4000` or configured port).
+
+#### A. Health Check (`GET /health`)
+Verify application status and shared database connectivity:
+```bash
+curl -s http://SYSTEM2_IP:4000/health
+```
+**Example Response (`200 OK`):**
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "backend_id": "backend-1"
+}
+```
+
+#### B. Performance Metrics (`GET /metrics`)
+Internal monitoring endpoint used by the dynamic Load Balancer to observe load:
+```bash
+curl -s http://SYSTEM2_IP:4000/metrics
+```
+**Example Response (`200 OK`):**
+```json
+{
+  "backend_id": "backend-1",
+  "healthy": true,
+  "cpu_percent": 14.2,
+  "memory_percent": 41.8,
+  "active_requests": 0,
+  "avg_latency_ms": 4.12,
+  "recent_latency_ms": 3.85,
+  "request_count": 142,
+  "uptime_seconds": 3600
+}
+```
+
+#### C. Post a Message (`POST /message`)
+Submit a new chat message:
+```bash
+curl -s -X POST http://SYSTEM2_IP:4000/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client-name": "alice",
+    "msg": "Hello from System 2!"
+  }'
+```
+**Example Response (`201 Created`):**
+```json
+{
+  "status": "success",
+  "message_id": "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d",
+  "id": "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d",
+  "created": true,
+  "client-name": "alice",
+  "backend_id": "backend-1"
+}
+```
+
+#### D. Fetch Feed (`GET /feed`)
+Retrieve persisted, decrypted, and signature-verified chat history:
+```bash
+curl -s http://SYSTEM3_IP:4000/feed
+```
+**Example Response (`200 OK`):**
+```json
+{
+  "status": "success",
+  "count": 1,
+  "backend_id": "backend-2",
+  "messages": [
+    {
+      "message_id": "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d",
+      "id": "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d",
+      "client-name": "alice",
+      "client_name": "alice",
+      "username": "alice",
+      "msg": "Hello from System 2!",
+      "message": "Hello from System 2!",
+      "timestamp": "2026-09-12T07:45:00Z",
+      "created_at": "2026-09-12T07:45:00Z",
+      "verified": true
+    }
+  ]
+}
+```
+
+---
+
+### 4. Cross-Backend Persistence Verification Procedure
+
+To verify that all backend instances share storage and remain stateless:
+
+1. **Step 1 — Send a message to Backend 1 (System 2):**
+   ```bash
+   curl -s -X POST http://SYSTEM2_IP:4000/message \
+     -H "Content-Type: application/json" \
+     -d '{"client-name": "sys2_client", "msg": "Cross-backend sync test", "message_id": "SYNC-TEST-001"}'
+   ```
+2. **Step 2 — Read feed from Backend 2 (System 3):**
+   ```bash
+   curl -s http://SYSTEM3_IP:4000/feed | grep "SYNC-TEST-001"
+   ```
+   *Expected:* The message appears in System 3's feed with `"verified": true`.
+3. **Step 3 — Read feed from Backend 3 (System 4):**
+   ```bash
+   curl -s http://SYSTEM4_IP:4000/feed | grep "SYNC-TEST-001"
+   ```
+   *Expected:* The exact same message appears in System 4's feed.
+
+---
+
+### 5. Idempotent Duplicate Prevention Verification
+
+To verify that repeated submissions or network retries do not produce duplicate records:
+
+1. **Submit message with a fixed ID to System 2:**
+   ```bash
+   curl -s -X POST http://SYSTEM2_IP:4000/message \
+     -H "Content-Type: application/json" \
+     -d '{"client-name": "alice", "msg": "Idempotent test", "message_id": "IDEMP-999"}'
+   ```
+   *Response:* Status `201 Created`, `"created": true`.
+
+2. **Retry the same message with the same ID to System 3:**
+   ```bash
+   curl -s -X POST http://SYSTEM3_IP:4000/message \
+     -H "Content-Type: application/json" \
+     -d '{"client-name": "alice", "msg": "Idempotent test", "message_id": "IDEMP-999"}'
+   ```
+   *Response:* Status `200 OK`, `"created": false`.
+
+3. **Check message count in feed:**
+   ```bash
+   curl -s http://SYSTEM4_IP:4000/feed | grep -c "IDEMP-999"
+   ```
+   *Expected Output:* `1` (The database enforces uniqueness; duplicate record was prevented).
+

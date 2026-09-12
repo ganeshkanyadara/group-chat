@@ -1,26 +1,138 @@
 import sqlite3
 import os
+import uuid
+import json
+import base64
+import urllib.request
+import urllib.parse
+import urllib.error
 
-DB_PATH = os.getenv("CHAT_DB_PATH", "chat.db")
+
+def get_db_path() -> str:
+    url = os.getenv("DATABASE_URL")
+    if url:
+        if url.startswith("sqlite:///"):
+            return url[len("sqlite:///"):]
+        elif url.startswith("sqlite://"):
+            return url[len("sqlite://"):]
+        return url.strip()
+    return os.getenv("CHAT_DB_PATH", "chat.db")
+
+
+DB_PATH = get_db_path()
+
+
+def is_remote_db(db_path: str | None = None) -> bool:
+    """Check if database destination is a remote HTTP/HTTPS database microservice."""
+    target = db_path or get_db_path()
+    return target.startswith("http://") or target.startswith("https://")
+
+
+def _http_request(url: str, method: str = "GET", data: dict | None = None, timeout: float = 10.0) -> dict | None:
+    """Perform synchronous JSON HTTP request to remote DB microservice on System 1."""
+    headers = {"Content-Type": "application/json"}
+    body_bytes = json.dumps(data).encode("utf-8") if data is not None else None
+    req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content = resp.read().decode("utf-8")
+            return json.loads(content) if content else {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        content = e.read().decode("utf-8")
+        try:
+            return json.loads(content)
+        except Exception:
+            raise e
+    except Exception:
+        raise
+
+
+def get_db_connection(db_path: str | None = None, timeout: float = 30.0) -> sqlite3.Connection:
+    """Return an SQLite connection configured with WAL and busy timeouts for concurrent access."""
+    target_path = db_path or get_db_path()
+    con = sqlite3.connect(target_path, timeout=timeout)
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA busy_timeout=30000;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    return con
+
+
+def check_db_health(db_path: str | None = None, timeout: float = 2.0) -> bool:
+    """Lightweight check verifying database connectivity (local file or remote HTTP server)."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        try:
+            res = _http_request(f"{target_path.rstrip('/')}/health", timeout=timeout)
+            return res is not None and res.get("status") == "healthy"
+        except Exception:
+            return False
+
+    try:
+        con = sqlite3.connect(target_path, timeout=timeout)
+        cur = con.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchone()
+        con.close()
+        return True
+    except Exception:
+        return False
 
 
 def init_db(db_path: str = DB_PATH) -> None:
-    """Initialize database tables for messages and public keys if they do not exist."""
-    con = sqlite3.connect(db_path)
+    """Initialize database tables for messages and public keys with WAL and safe migrations."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        _http_request(f"{target_path.rstrip('/')}/init", method="POST")
+        return
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
-    # Table storing binary encrypted ciphertext, nonce, and signature
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            message_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_id     TEXT    NOT NULL,
-            sender_id   TEXT    NOT NULL,
-            ciphertext  BLOB    NOT NULL,
-            nonce       BLOB    NOT NULL,
-            signature   BLOB    NOT NULL,
-            timestamp   TEXT    NOT NULL
-        );
-    """)
+    # Check if messages table already exists and if message_id is INTEGER
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages';")
+    table_exists = cur.fetchone() is not None
+
+    if table_exists:
+        cur.execute("PRAGMA table_info(messages);")
+        columns = cur.fetchall()
+        msg_id_col = next((c for c in columns if c[1] == "message_id"), None)
+        if msg_id_col and "INT" in str(msg_id_col[2]).upper():
+            # Migrate to TEXT PRIMARY KEY so UUIDs and string IDs are supported
+            cur.execute("ALTER TABLE messages RENAME TO messages_old;")
+            cur.execute("""
+                CREATE TABLE messages (
+                    message_id  TEXT PRIMARY KEY,
+                    room_id     TEXT NOT NULL,
+                    sender_id   TEXT NOT NULL,
+                    ciphertext  BLOB NOT NULL,
+                    nonce       BLOB NOT NULL,
+                    signature   BLOB NOT NULL,
+                    timestamp   TEXT NOT NULL
+                );
+            """)
+            cur.execute("""
+                INSERT INTO messages (message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp)
+                SELECT CAST(message_id AS TEXT), room_id, sender_id, ciphertext, nonce, signature, timestamp
+                FROM messages_old;
+            """)
+            cur.execute("DROP TABLE messages_old;")
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id  TEXT PRIMARY KEY,
+                room_id     TEXT NOT NULL,
+                sender_id   TEXT NOT NULL,
+                ciphertext  BLOB NOT NULL,
+                nonce       BLOB NOT NULL,
+                signature   BLOB NOT NULL,
+                timestamp   TEXT NOT NULL
+            );
+        """)
 
     # Table storing raw public keys for sender signature verification
     cur.execute("""
@@ -35,8 +147,18 @@ def init_db(db_path: str = DB_PATH) -> None:
 
 
 def save_public_key(username: str, public_key_bytes: bytes, db_path: str = DB_PATH) -> None:
-    """Store or update user's raw Ed25519 public key bytes in SQLite."""
-    con = sqlite3.connect(db_path)
+    """Store or update user's raw Ed25519 public key bytes in SQLite (local or remote HTTP)."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        pub_b64 = base64.b64encode(public_key_bytes).decode("utf-8")
+        _http_request(
+            f"{target_path.rstrip('/')}/keys",
+            method="POST",
+            data={"username": username, "public_key": pub_b64},
+        )
+        return
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
     cur.execute(
@@ -53,8 +175,16 @@ def save_public_key(username: str, public_key_bytes: bytes, db_path: str = DB_PA
 
 
 def load_public_key(username: str, db_path: str = DB_PATH) -> bytes | None:
-    """Load user's raw public key bytes from SQLite."""
-    con = sqlite3.connect(db_path)
+    """Load user's raw public key bytes from SQLite (local or remote HTTP)."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        encoded_user = urllib.parse.quote(username)
+        res = _http_request(f"{target_path.rstrip('/')}/keys/{encoded_user}", method="GET")
+        if res and "public_key" in res:
+            return base64.b64decode(res["public_key"])
+        return None
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
     cur.execute(
@@ -75,21 +205,49 @@ def store_message(
     nonce: bytes,
     signature: bytes,
     timestamp: str,
+    message_id: str | None = None,
+    return_created: bool = False,
     db_path: str = DB_PATH,
-) -> int:
+) -> str | tuple[str, bool]:
     """
-    Insert an encrypted, signed message record into SQLite database.
+    Insert an encrypted, signed message record into SQLite database (local or remote HTTP).
     Plaintext MUST NEVER be stored.
+    Enforces uniqueness using PRIMARY KEY and ON CONFLICT DO NOTHING.
+    If message_id is omitted, a UUID is automatically generated.
     """
-    con = sqlite3.connect(db_path)
+    target_path = db_path or get_db_path()
+    if not message_id:
+        message_id = str(uuid.uuid4())
+    else:
+        message_id = str(message_id).strip()
+
+    if is_remote_db(target_path):
+        payload = {
+            "message_id": message_id,
+            "room_id": room_id,
+            "sender_id": sender_id,
+            "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+            "nonce": base64.b64encode(nonce).decode("utf-8"),
+            "signature": base64.b64encode(signature).decode("utf-8"),
+            "timestamp": timestamp,
+        }
+        res = _http_request(f"{target_path.rstrip('/')}/messages", method="POST", data=payload)
+        created = res.get("created", True) if res else True
+        if return_created:
+            return message_id, created
+        return message_id
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
     cur.execute(
         """
-        INSERT INTO messages (room_id, sender_id, ciphertext, nonce, signature, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO NOTHING
         """,
         (
+            message_id,
             room_id,
             sender_id,
             sqlite3.Binary(ciphertext),
@@ -99,26 +257,48 @@ def store_message(
         ),
     )
 
-    msg_id = cur.lastrowid
+    created = cur.rowcount > 0
     con.commit()
     con.close()
-    return msg_id
+
+    if return_created:
+        return message_id, created
+    return message_id
 
 
 def load_history_raw(room_id: str, limit: int = 50, db_path: str = DB_PATH) -> list[dict]:
     """
-    Fetch the last `limit` encrypted messages for `room_id`.
+    Fetch the last `limit` encrypted messages for `room_id` (local or remote HTTP).
     Returns list of dicts with raw binary fields.
     """
-    con = sqlite3.connect(db_path)
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        url = f"{target_path.rstrip('/')}/messages?room_id={urllib.parse.quote(room_id)}&limit={int(limit)}"
+        res = _http_request(url, method="GET")
+        if not res or "messages" not in res:
+            return []
+        records = []
+        for m in res["messages"]:
+            records.append({
+                "message_id": m["message_id"],
+                "room_id": m["room_id"],
+                "sender_id": m["sender_id"],
+                "ciphertext": base64.b64decode(m["ciphertext"]),
+                "nonce": base64.b64decode(m["nonce"]),
+                "signature": base64.b64decode(m["signature"]),
+                "timestamp": m["timestamp"],
+            })
+        return records
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
     cur.execute(
         """
-        SELECT message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp
+        SELECT message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp, rowid
         FROM messages
         WHERE room_id = ?
-        ORDER BY message_id DESC
+        ORDER BY rowid DESC
         LIMIT ?
         """,
         (room_id, limit),
@@ -142,9 +322,26 @@ def load_history_raw(room_id: str, limit: int = 50, db_path: str = DB_PATH) -> l
     return records
 
 
-def get_message_by_id(message_id: int, db_path: str = DB_PATH) -> dict | None:
-    """Fetch a single message by message_id."""
-    con = sqlite3.connect(db_path)
+def get_message_by_id(message_id: str | int, db_path: str = DB_PATH) -> dict | None:
+    """Fetch a single message by message_id (local or remote HTTP)."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        url = f"{target_path.rstrip('/')}/messages/{urllib.parse.quote(str(message_id))}"
+        res = _http_request(url, method="GET")
+        if not res or "message" not in res:
+            return None
+        m = res["message"]
+        return {
+            "message_id": m["message_id"],
+            "room_id": m["room_id"],
+            "sender_id": m["sender_id"],
+            "ciphertext": base64.b64decode(m["ciphertext"]),
+            "nonce": base64.b64decode(m["nonce"]),
+            "signature": base64.b64decode(m["signature"]),
+            "timestamp": m["timestamp"],
+        }
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
     cur.execute(
@@ -153,7 +350,7 @@ def get_message_by_id(message_id: int, db_path: str = DB_PATH) -> dict | None:
         FROM messages
         WHERE message_id = ?
         """,
-        (message_id,),
+        (str(message_id),),
     )
 
     row = cur.fetchone()
@@ -174,28 +371,38 @@ def get_message_by_id(message_id: int, db_path: str = DB_PATH) -> dict | None:
 
 
 def tamper_message(
-    message_id: int,
+    message_id: str | int,
     new_ciphertext: bytes | None = None,
     new_signature: bytes | None = None,
     db_path: str = DB_PATH,
 ) -> bool:
     """
     Tamper helper for testing/demonstration purposes.
-    Modifies stored ciphertext or signature directly in SQLite database.
+    Modifies stored ciphertext or signature directly in SQLite database (local or remote).
     """
-    con = sqlite3.connect(db_path)
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        payload = {"message_id": str(message_id)}
+        if new_ciphertext is not None:
+            payload["ciphertext"] = base64.b64encode(new_ciphertext).decode("utf-8")
+        if new_signature is not None:
+            payload["signature"] = base64.b64encode(new_signature).decode("utf-8")
+        res = _http_request(f"{target_path.rstrip('/')}/tamper", method="POST", data=payload)
+        return res.get("modified", False) if res else False
+
+    con = get_db_connection(target_path)
     cur = con.cursor()
 
     if new_ciphertext is not None:
         cur.execute(
             "UPDATE messages SET ciphertext = ? WHERE message_id = ?",
-            (sqlite3.Binary(new_ciphertext), message_id),
+            (sqlite3.Binary(new_ciphertext), str(message_id)),
         )
 
     if new_signature is not None:
         cur.execute(
             "UPDATE messages SET signature = ? WHERE message_id = ?",
-            (sqlite3.Binary(new_signature), message_id),
+            (sqlite3.Binary(new_signature), str(message_id)),
         )
 
     modified = cur.rowcount > 0

@@ -3,6 +3,10 @@
 keys/
 pdf.tex
 pdf.log
+assignment_5_report.md
+assignment_5_report.tex
+load-balancer/
+db_server.py
 
 # Database
 *.db
