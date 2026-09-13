@@ -54,10 +54,10 @@ def _get_pg_pool(dsn: str):
             if _pg_pool is None:
                 import psycopg2
                 from psycopg2.pool import ThreadedConnectionPool
-                # High-capacity connection pool for handling 1000+ concurrent users
+                # Lean connection pool for 512MB container constraint (18 conns * 3 nodes = 54 total)
                 _pg_pool = ThreadedConnectionPool(
-                    minconn=10,
-                    maxconn=200,
+                    minconn=5,
+                    maxconn=18,
                     dsn=dsn,
                 )
     return _pg_pool
@@ -67,11 +67,20 @@ def _get_pg_pool(dsn: str):
 def get_pg_conn(dsn: str | None = None):
     target = dsn or get_db_path()
     pool = _get_pg_pool(target)
-    conn = pool.getconn()
+    conn = None
+    start = time.monotonic()
+    while conn is None:
+        try:
+            conn = pool.getconn()
+        except Exception:
+            if (time.monotonic() - start) > 5.0:
+                raise
+            time.sleep(0.005)
     try:
         yield conn
     finally:
-        pool.putconn(conn)
+        if conn is not None:
+            pool.putconn(conn)
 
 
 # ============================================================
@@ -180,8 +189,14 @@ def check_db_health(db_path: str | None = None, timeout: float = 2.0) -> bool:
                     cur.execute("SELECT 1;")
                     cur.fetchone()
             _record_db_success()
+            with _health_lock:
+                _last_health_check_time = now
+                _last_health_status = True
             return True
         except Exception:
+            with _health_lock:
+                _last_health_check_time = now
+                _last_health_status = False
             return False
 
     # 2. Remote HTTP Microservice
@@ -234,14 +249,14 @@ def init_db(db_path: str = DB_PATH) -> None:
                     CREATE TABLE IF NOT EXISTS active_users (
                         username    TEXT PRIMARY KEY,
                         backend_id  TEXT NOT NULL,
-                        last_seen   INTEGER NOT NULL
+                        last_seen   BIGINT NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS system_events (
                         id          BIGSERIAL PRIMARY KEY,
                         event_type  TEXT NOT NULL,
                         message     TEXT NOT NULL,
                         sender_node TEXT NOT NULL,
-                        timestamp   INTEGER NOT NULL
+                        timestamp   BIGINT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room_id, timestamp);
                 """)
@@ -828,7 +843,7 @@ def get_all_online_users(db_path: str = DB_PATH, prune_seconds: int = 60) -> lis
         now = int(time.time())
         with get_pg_conn(target_path) as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM active_users WHERE (%s - last_seen) > %s;", (now, prune_seconds))
+                cur.execute("DELETE FROM active_users WHERE last_seen < %s;", (now - prune_seconds,))
                 cur.execute("SELECT username, backend_id, last_seen FROM active_users ORDER BY username ASC;")
                 rows = cur.fetchall()
             conn.commit()
