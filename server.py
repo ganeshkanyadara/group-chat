@@ -138,11 +138,14 @@ async def send_user_list(app: web.Application | None = None):
 # CHAT HISTORY LOADER & VERIFIER
 # ============================================================
 
-def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db_path: str = DB_PATH) -> list[dict]:
+_feed_cache: dict[str, dict] = {}
+
+
+def get_processed_history(room_id: str = ROOM_ID, limit: int = 100000, db_path: str = DB_PATH) -> list[dict]:
     """
     Retrieve encrypted messages from SQLite, decrypt ciphertext using AES-GCM,
     and verify digital signatures against the canonical payload.
-    
+    Uses in-memory cache to avoid re-decrypting and re-verifying known messages.
     Returns list of message dicts formatted for client consumption.
     """
     raw_records = load_history_raw(room_id=room_id, limit=limit, db_path=db_path)
@@ -150,7 +153,11 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
     cached_pub_keys = {}
 
     for record in raw_records:
-        msg_id = record["message_id"]
+        msg_id_str = str(record["message_id"])
+        if msg_id_str in _feed_cache:
+            history.append(_feed_cache[msg_id_str])
+            continue
+
         sender_id = record["sender_id"]
         ciphertext = record["ciphertext"]
         nonce = record["nonce"]
@@ -184,9 +191,9 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
             except Exception:
                 verified = False
 
-        history.append({
-            "message_id": str(msg_id),
-            "id": str(msg_id),
+        item = {
+            "message_id": msg_id_str,
+            "id": msg_id_str,
             "client-name": sender_id,
             "client_name": sender_id,
             "username": sender_id,
@@ -197,7 +204,9 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
             "timestamp": timestamp,
             "created_at": timestamp,
             "verified": verified,
-        })
+        }
+        _feed_cache[msg_id_str] = item
+        history.append(item)
 
     return history
 
@@ -364,6 +373,20 @@ async def post_message_handler(request: web.Request) -> web.Response:
         # 4. Broadcast to local WebSocket clients if newly created
         if was_created:
             seen_message_ids.add(str(persisted_id))
+            _feed_cache[str(persisted_id)] = {
+                "message_id": str(persisted_id),
+                "id": str(persisted_id),
+                "client-name": client_name,
+                "client_name": client_name,
+                "username": client_name,
+                "user": client_name,
+                "msg": msg_text,
+                "message": msg_text,
+                "text": msg_text,
+                "timestamp": timestamp,
+                "created_at": timestamp,
+                "verified": True,
+            }
             if connected_users:
                 asyncio.create_task(broadcast({
                     "type": "message",
@@ -399,12 +422,16 @@ async def get_feed_handler(request: web.Request) -> web.Response:
     """
     GET /feed
     Retrieves decrypted, verified messages from the shared persistent database.
+    Supports ?limit= query parameter, defaulting to 100000 (all messages).
     """
     backend_id = get_app_backend_id(request.app)
     db_path = get_app_db_path(request.app)
 
+    limit_param = request.query.get("limit") or request.query.get("count") or request.query.get("n")
+    limit = int(limit_param) if limit_param and limit_param.isdigit() else 100000
+
     try:
-        history_records = await asyncio.to_thread(get_processed_history, room_id=ROOM_ID, limit=HISTORY_LIMIT, db_path=db_path)
+        history_records = await asyncio.to_thread(get_processed_history, room_id=ROOM_ID, limit=limit, db_path=db_path)
         return web.json_response({
             "status": "success",
             "messages": history_records,

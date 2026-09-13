@@ -333,7 +333,7 @@ def store_message(
     return message_id
 
 
-def load_history_raw(room_id: str, limit: int = 50, db_path: str = DB_PATH) -> list[dict]:
+def load_history_raw(room_id: str, limit: int = 100000, db_path: str = DB_PATH) -> list[dict]:
     """
     Fetch the last `limit` encrypted messages for `room_id` (local or remote HTTP).
     Returns list of dicts with raw binary fields.
