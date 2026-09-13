@@ -6,6 +6,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from aiohttp import web, WSMsgType
+import threading
+try:
+    threading.stack_size(262144)
+except Exception:
+    pass
 
 # Automatically load .env file if present (even without python-dotenv package)
 def _load_env():
@@ -139,6 +144,36 @@ async def send_user_list(app: web.Application | None = None):
 # ============================================================
 
 _feed_cache: dict[str, dict] = {}
+_cached_feed_records: list[dict] = []
+_cached_feed_json_bytes: bytes = b'{"status": "success", "messages": [], "count": 0}'
+_last_feed_refresh: float = 0.0
+_feed_lock = threading.Lock()
+
+
+def get_cached_feed_json(backend_id: str, db_path: str = DB_PATH) -> bytes:
+    """Return pre-computed UTF-8 JSON bytes for GET /feed with 0.5s TTL to eliminate memory and DB churn."""
+    global _cached_feed_records, _cached_feed_json_bytes, _last_feed_refresh
+    now = time.monotonic()
+    with _feed_lock:
+        if (now - _last_feed_refresh) < 0.5 and _cached_feed_json_bytes:
+            return _cached_feed_json_bytes
+
+        try:
+            records = get_processed_history(room_id=ROOM_ID, limit=100000, db_path=db_path)
+            _cached_feed_records = records
+            payload = {
+                "status": "success",
+                "messages": _cached_feed_records,
+                "count": len(_cached_feed_records),
+                "backend_id": backend_id,
+            }
+            _cached_feed_json_bytes = json.dumps(payload).encode("utf-8")
+            _last_feed_refresh = now
+        except Exception as e:
+            if _cached_feed_json_bytes:
+                return _cached_feed_json_bytes
+            raise e
+        return _cached_feed_json_bytes
 
 
 def get_processed_history(room_id: str = ROOM_ID, limit: int = 100000, db_path: str = DB_PATH) -> list[dict]:
@@ -387,6 +422,8 @@ async def post_message_handler(request: web.Request) -> web.Response:
                 "created_at": timestamp,
                 "verified": True,
             }
+            with _feed_lock:
+                _last_feed_refresh = 0.0  # Force immediate refresh on next GET /feed
             if connected_users:
                 asyncio.create_task(broadcast({
                     "type": "message",
@@ -428,16 +465,22 @@ async def get_feed_handler(request: web.Request) -> web.Response:
     db_path = get_app_db_path(request.app)
 
     limit_param = request.query.get("limit") or request.query.get("count") or request.query.get("n")
-    limit = int(limit_param) if limit_param and limit_param.isdigit() else 100000
+    if limit_param and limit_param.isdigit() and int(limit_param) < 10000:
+        limit = int(limit_param)
+        try:
+            history_records = await asyncio.to_thread(get_processed_history, room_id=ROOM_ID, limit=limit, db_path=db_path)
+            return web.json_response({
+                "status": "success",
+                "messages": history_records,
+                "count": len(history_records),
+                "backend_id": backend_id,
+            }, status=200)
+        except Exception as e:
+            return web.json_response({"status": "error", "error": str(e)}, status=500)
 
     try:
-        history_records = await asyncio.to_thread(get_processed_history, room_id=ROOM_ID, limit=limit, db_path=db_path)
-        return web.json_response({
-            "status": "success",
-            "messages": history_records,
-            "count": len(history_records),
-            "backend_id": backend_id,
-        }, status=200)
+        json_bytes = await asyncio.to_thread(get_cached_feed_json, backend_id=backend_id, db_path=db_path)
+        return web.Response(body=json_bytes, content_type="application/json", status=200)
     except Exception as e:
         print(f"[{backend_id}] [ERROR] Failed to fetch feed: {e}")
         return web.json_response(
@@ -840,7 +883,7 @@ async def start_background_tasks(app: web.Application):
     import concurrent.futures
     try:
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=300))
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=20))
     except Exception:
         pass
 
