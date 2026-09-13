@@ -190,8 +190,10 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = HISTORY_LIMIT, db
             "client-name": sender_id,
             "client_name": sender_id,
             "username": sender_id,
+            "user": sender_id,
             "msg": plaintext,
             "message": plaintext,
+            "text": plaintext,
             "timestamp": timestamp,
             "created_at": timestamp,
             "verified": verified,
@@ -261,17 +263,45 @@ async def post_message_handler(request: web.Request) -> web.Response:
     backend_id = get_app_backend_id(request.app)
     db_path = get_app_db_path(request.app)
 
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response(
-            {"status": "error", "error": "Invalid JSON format in request body"},
-            status=400,
-        )
+    content_type = request.content_type or ""
+    data = None
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "error": "Invalid JSON format in request body"},
+                status=400,
+            )
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        try:
+            post_data = await request.post()
+            data = dict(post_data)
+        except Exception:
+            return web.json_response(
+                {"status": "error", "error": "Invalid form data in request body"},
+                status=400,
+            )
+    else:
+        # Auto-detect: try JSON, then try form data
+        try:
+            data = await request.json()
+        except Exception:
+            try:
+                post_data = await request.post()
+                if post_data:
+                    data = dict(post_data)
+                else:
+                    data = dict(request.query)
+            except Exception:
+                return web.json_response(
+                    {"status": "error", "error": "Unsupported request body format"},
+                    status=400,
+                )
 
     if not isinstance(data, dict):
         return web.json_response(
-            {"status": "error", "error": "Request body must be a JSON object"},
+            {"status": "error", "error": "Request body must be a JSON object or form data"},
             status=400,
         )
 
@@ -318,7 +348,8 @@ async def post_message_handler(request: web.Request) -> web.Response:
         ciphertext_bytes, nonce_bytes = encrypt_message(msg_text)
 
         # 3. Idempotent SQLite Persistence (PRIMARY KEY / ON CONFLICT DO NOTHING)
-        persisted_id, was_created = store_message(
+        persisted_id, was_created = await asyncio.to_thread(
+            store_message,
             room_id=ROOM_ID,
             sender_id=client_name,
             ciphertext=ciphertext_bytes,
@@ -349,6 +380,7 @@ async def post_message_handler(request: web.Request) -> web.Response:
                 "message_id": persisted_id,
                 "id": persisted_id,
                 "created": was_created,
+                "duplicate": not was_created,
                 "client-name": client_name,
                 "backend_id": backend_id,
             },
@@ -372,7 +404,7 @@ async def get_feed_handler(request: web.Request) -> web.Response:
     db_path = get_app_db_path(request.app)
 
     try:
-        history_records = get_processed_history(room_id=ROOM_ID, limit=HISTORY_LIMIT, db_path=db_path)
+        history_records = await asyncio.to_thread(get_processed_history, room_id=ROOM_ID, limit=HISTORY_LIMIT, db_path=db_path)
         return web.json_response({
             "status": "success",
             "messages": history_records,
@@ -395,7 +427,7 @@ async def get_health_handler(request: web.Request) -> web.Response:
     backend_id = get_app_backend_id(request.app)
     db_path = get_app_db_path(request.app)
 
-    db_ok = check_db_health(db_path)
+    db_ok = await asyncio.to_thread(check_db_health, db_path, 2.0)
     if db_ok:
         return web.json_response({
             "status": "healthy",
@@ -521,7 +553,11 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         }
 
         print(f"[{app_backend_id}] [JOIN] {username} connected from {ip} | Online: {len(connected_users)}/{MAX_USERS}")
-        await send_json(ws, {"type": "authenticated", "username": username})
+        await send_json(ws, {
+            "type": "authenticated",
+            "username": username,
+            "backend_id": app_backend_id
+        })
 
         # 3. History delivery
         history_messages = get_processed_history(ROOM_ID, HISTORY_LIMIT, db_path=app_db_path)
