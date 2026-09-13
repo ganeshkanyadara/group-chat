@@ -209,6 +209,8 @@ def init_db(db_path: str = DB_PATH) -> None:
         );
     """)
 
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room_id, timestamp);")
+
     con.commit()
     con.close()
 
