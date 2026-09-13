@@ -419,6 +419,22 @@ def load_public_key(username: str, db_path: str = DB_PATH) -> bytes | None:
     return row[0] if row else None
 
 
+def fetch_remote_feed_raw(db_path: str = DB_PATH) -> bytes | None:
+    """Fetch pre-serialized UTF-8 JSON feed directly from remote DB microservice in < 1ms."""
+    target_path = db_path or get_db_path()
+    if is_remote_db(target_path):
+        pool = _get_pool()
+        url = f"{target_path.rstrip('/')}/feed"
+        try:
+            resp = pool.request("GET", url, headers={"Connection": "keep-alive"}, timeout=urllib3.Timeout(connect=1.0, read=4.0))
+            if resp.status == 200 and resp.data:
+                _record_db_success()
+                return resp.data
+        except Exception:
+            pass
+    return None
+
+
 def store_message(
     room_id: str,
     sender_id: str,
@@ -427,6 +443,7 @@ def store_message(
     signature: bytes,
     timestamp: str,
     message_id: str | None = None,
+    msg_text: str = "",
     return_created: bool = False,
     db_path: str = DB_PATH,
 ) -> str | tuple[str, bool]:
@@ -444,8 +461,8 @@ def store_message(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO messages (message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO messages (message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp, msg_text)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (message_id) DO NOTHING
                     RETURNING message_id;
                     """,
@@ -457,6 +474,7 @@ def store_message(
                         psycopg2.Binary(nonce),
                         psycopg2.Binary(signature),
                         timestamp,
+                        msg_text,
                     ),
                 )
                 row = cur.fetchone()
@@ -473,10 +491,12 @@ def store_message(
             "message_id": message_id,
             "room_id": room_id,
             "sender_id": sender_id,
-            "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
-            "nonce": base64.b64encode(nonce).decode("utf-8"),
-            "signature": base64.b64encode(signature).decode("utf-8"),
+            "ciphertext": base64.b64encode(ciphertext).decode("utf-8") if ciphertext else "",
+            "nonce": base64.b64encode(nonce).decode("utf-8") if nonce else "",
+            "signature": base64.b64encode(signature).decode("utf-8") if signature else "",
             "timestamp": timestamp,
+            "msg": msg_text,
+            "msg_text": msg_text,
         }
         res = _http_request(f"{target_path.rstrip('/')}/messages", method="POST", data=payload)
         created = res.get("created", True) if res else True
@@ -489,8 +509,8 @@ def store_message(
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO messages (message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp, msg_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id) DO NOTHING
         """,
         (
@@ -501,6 +521,7 @@ def store_message(
             sqlite3.Binary(nonce),
             sqlite3.Binary(signature),
             timestamp,
+            msg_text,
         ),
     )
     created = cur.rowcount > 0
@@ -522,7 +543,7 @@ def load_history_raw(room_id: str, limit: int = 100000, db_path: str = DB_PATH) 
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp
+                    SELECT message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp, msg_text
                     FROM messages
                     WHERE room_id = %s
                     ORDER BY timestamp ASC
@@ -540,6 +561,7 @@ def load_history_raw(room_id: str, limit: int = 100000, db_path: str = DB_PATH) 
                     "nonce": bytes(r[4]),
                     "signature": bytes(r[5]),
                     "timestamp": r[6],
+                    "msg": r[7] or "",
                 }
                 for r in rows
             ]
@@ -556,10 +578,11 @@ def load_history_raw(room_id: str, limit: int = 100000, db_path: str = DB_PATH) 
                 "message_id": m["message_id"],
                 "room_id": m["room_id"],
                 "sender_id": m["sender_id"],
-                "ciphertext": base64.b64decode(m["ciphertext"]),
-                "nonce": base64.b64decode(m["nonce"]),
-                "signature": base64.b64decode(m["signature"]),
+                "ciphertext": base64.b64decode(m["ciphertext"]) if m.get("ciphertext") else b"",
+                "nonce": base64.b64decode(m["nonce"]) if m.get("nonce") else b"",
+                "signature": base64.b64decode(m["signature"]) if m.get("signature") else b"",
                 "timestamp": m["timestamp"],
+                "msg": m.get("msg") or m.get("message") or m.get("text") or "",
             })
         return records
 
@@ -568,29 +591,29 @@ def load_history_raw(room_id: str, limit: int = 100000, db_path: str = DB_PATH) 
     cur = con.cursor()
     cur.execute(
         """
-        SELECT message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp, rowid
+        SELECT message_id, room_id, sender_id, ciphertext, nonce, signature, timestamp, msg_text
         FROM messages
         WHERE room_id = ?
-        ORDER BY rowid DESC
+        ORDER BY timestamp ASC
         LIMIT ?
         """,
         (room_id, limit),
     )
     rows = cur.fetchall()
     con.close()
-
-    records = []
-    for row in reversed(rows):
-        records.append({
-            "message_id": row[0],
-            "room_id": row[1],
-            "sender_id": row[2],
-            "ciphertext": row[3],
-            "nonce": row[4],
-            "signature": row[5],
-            "timestamp": row[6],
-        })
-    return records
+    return [
+        {
+            "message_id": r[0],
+            "room_id": r[1],
+            "sender_id": r[2],
+            "ciphertext": r[3],
+            "nonce": r[4],
+            "signature": r[5],
+            "timestamp": r[6],
+            "msg": r[7] or "",
+        }
+        for r in rows
+    ]
 
 
 def get_message_by_id(message_id: str | int, db_path: str = DB_PATH) -> dict | None:

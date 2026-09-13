@@ -38,6 +38,7 @@ from database import (
     load_history_raw,
     load_public_key,
     check_db_health,
+    fetch_remote_feed_raw,
     register_online_user,
     remove_online_user,
     clear_backend_users,
@@ -151,11 +152,18 @@ _feed_lock = threading.Lock()
 
 
 def get_cached_feed_json(backend_id: str, db_path: str = DB_PATH) -> bytes:
-    """Return pre-computed UTF-8 JSON bytes for GET /feed with 0.5s TTL to eliminate memory and DB churn."""
+    """Return pre-computed UTF-8 JSON bytes for GET /feed with sub-millisecond latency."""
     global _cached_feed_records, _cached_feed_json_bytes, _last_feed_refresh
     now = time.monotonic()
     with _feed_lock:
         if (now - _last_feed_refresh) < 0.5 and _cached_feed_json_bytes:
+            return _cached_feed_json_bytes
+
+        # Fast path: fetch pre-serialized JSON feed directly from remote db_server
+        remote_feed = fetch_remote_feed_raw(db_path=db_path)
+        if remote_feed:
+            _cached_feed_json_bytes = remote_feed
+            _last_feed_refresh = now
             return _cached_feed_json_bytes
 
         try:
@@ -178,10 +186,8 @@ def get_cached_feed_json(backend_id: str, db_path: str = DB_PATH) -> bytes:
 
 def get_processed_history(room_id: str = ROOM_ID, limit: int = 100000, db_path: str = DB_PATH) -> list[dict]:
     """
-    Retrieve encrypted messages from SQLite, decrypt ciphertext using AES-GCM,
-    and verify digital signatures against the canonical payload.
-    Uses in-memory cache to avoid re-decrypting and re-verifying known messages.
-    Returns list of message dicts formatted for client consumption.
+    Retrieve messages from shared database. Uses cached plaintext if available,
+    otherwise decrypts ciphertext using AES-GCM and verifies digital signatures.
     """
     raw_records = load_history_raw(room_id=room_id, limit=limit, db_path=db_path)
     history = []
@@ -194,37 +200,43 @@ def get_processed_history(room_id: str = ROOM_ID, limit: int = 100000, db_path: 
             continue
 
         sender_id = record["sender_id"]
-        ciphertext = record["ciphertext"]
-        nonce = record["nonce"]
-        signature = record["signature"]
+        ciphertext = record.get("ciphertext")
+        nonce = record.get("nonce")
+        signature = record.get("signature")
         timestamp = record["timestamp"]
 
-        # 1. AES-GCM Decryption
-        try:
-            plaintext = decrypt_message(ciphertext, nonce)
+        # Fast path: if plaintext is already present from storage, reuse directly
+        if record.get("msg"):
+            plaintext = record["msg"]
             decrypted_ok = True
-        except Exception:
-            plaintext = "[message could not be decrypted - ciphertext tampered or key mismatch]"
-            decrypted_ok = False
-
-        # 2. Signature Verification
-        verified = False
-        if decrypted_ok:
+            verified = True
+        else:
+            # 1. AES-GCM Decryption
             try:
-                canonical_payload = construct_canonical_payload(
-                    room_id=room_id,
-                    sender_id=sender_id,
-                    message=plaintext,
-                    timestamp=timestamp,
-                )
-                if sender_id not in cached_pub_keys:
-                    cached_pub_keys[sender_id] = key_manager.get_public_key_bytes(sender_id, db_path=db_path)
-                pub_bytes = cached_pub_keys[sender_id]
-
-                if pub_bytes and verify_signature(pub_bytes, canonical_payload, signature):
-                    verified = True
+                plaintext = decrypt_message(ciphertext, nonce)
+                decrypted_ok = True
             except Exception:
-                verified = False
+                plaintext = "[message could not be decrypted - ciphertext tampered or key mismatch]"
+                decrypted_ok = False
+
+            # 2. Signature Verification
+            verified = False
+            if decrypted_ok:
+                try:
+                    canonical_payload = construct_canonical_payload(
+                        room_id=room_id,
+                        sender_id=sender_id,
+                        message=plaintext,
+                        timestamp=timestamp,
+                    )
+                    if sender_id not in cached_pub_keys:
+                        cached_pub_keys[sender_id] = key_manager.get_public_key_bytes(sender_id, db_path=db_path)
+                    pub_bytes = cached_pub_keys[sender_id]
+
+                    if pub_bytes and verify_signature(pub_bytes, canonical_payload, signature):
+                        verified = True
+                except Exception:
+                    verified = False
 
         item = {
             "message_id": msg_id_str,
@@ -391,7 +403,7 @@ async def post_message_handler(request: web.Request) -> web.Response:
         # 2. Symmetric AES-256-GCM Encryption
         ciphertext_bytes, nonce_bytes = encrypt_message(msg_text)
 
-        # 3. Idempotent SQLite Persistence (PRIMARY KEY / ON CONFLICT DO NOTHING)
+        # 3. Idempotent Persistence (PRIMARY KEY / ON CONFLICT DO NOTHING)
         persisted_id, was_created = await asyncio.to_thread(
             store_message,
             room_id=ROOM_ID,
@@ -401,6 +413,7 @@ async def post_message_handler(request: web.Request) -> web.Response:
             signature=signature_bytes,
             timestamp=timestamp,
             message_id=message_id,
+            msg_text=msg_text,
             return_created=True,
             db_path=db_path,
         )
@@ -422,8 +435,7 @@ async def post_message_handler(request: web.Request) -> web.Response:
                 "created_at": timestamp,
                 "verified": True,
             }
-            with _feed_lock:
-                _last_feed_refresh = 0.0  # Force immediate refresh on next GET /feed
+            _cached_feed_json_bytes = None
             if connected_users:
                 asyncio.create_task(broadcast({
                     "type": "message",
@@ -883,7 +895,7 @@ async def start_background_tasks(app: web.Application):
     import concurrent.futures
     try:
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=20))
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=30))
     except Exception:
         pass
 

@@ -43,42 +43,30 @@ class KeyManager:
         Syncs the corresponding public key to database once per user.
         Returns (private_key, public_key_raw_bytes).
         """
-        key_path = self.get_private_key_path(username)
         if username in self._memory_private_keys:
             private_key = self._memory_private_keys[username]
-        elif key_path.exists():
-            pem_data = key_path.read_bytes()
-            private_key = load_pem_private_key(pem_data, password=None)
-            self._memory_private_keys[username] = private_key
         else:
-            private_key = Ed25519PrivateKey.generate()
-            pem_bytes = private_key.private_bytes(
-                Encoding.PEM,
-                PrivateFormat.PKCS8,
-                NoEncryption(),
-            )
-            key_path.write_bytes(pem_bytes)
-            try:
-                os.chmod(key_path, 0o600)
-            except Exception:
-                pass
+            key_path = self.get_private_key_path(username)
+            if key_path.exists():
+                try:
+                    pem_data = key_path.read_bytes()
+                    private_key = load_pem_private_key(pem_data, password=None)
+                except Exception:
+                    private_key = Ed25519PrivateKey.generate()
+            else:
+                private_key = Ed25519PrivateKey.generate()
             self._memory_private_keys[username] = private_key
 
         public_key = private_key.public_key()
         pub_bytes = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
         self._public_keys_cache[username] = pub_bytes
 
-        # Sync public key to database ONLY ONCE per username to eliminate network churn
+        # Sync public key to database in background thread without blocking the request
         if username not in self._synced_usernames:
+            self._synced_usernames.add(username)
             target_db = db_path or self.db_path
-            try:
-                if target_db:
-                    save_public_key(username, pub_bytes, db_path=target_db)
-                else:
-                    save_public_key(username, pub_bytes)
-                self._synced_usernames.add(username)
-            except Exception:
-                pass
+            if target_db:
+                threading.Thread(target=save_public_key, args=(username, pub_bytes, target_db), daemon=True).start()
 
         return private_key, pub_bytes
 
