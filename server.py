@@ -837,6 +837,13 @@ async def cluster_sync_loop(app: web.Application):
 
 async def start_background_tasks(app: web.Application):
     """Startup and cleanup context for cluster sync loop, presence, and heartbeat."""
+    import concurrent.futures
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=300))
+    except Exception:
+        pass
+
     app_backend_id = get_app_backend_id(app)
     app_db_path = get_app_db_path(app)
     try:
