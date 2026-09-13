@@ -31,68 +31,76 @@ def is_remote_db(db_path: str | None = None) -> bool:
     return target.startswith("http://") or target.startswith("https://")
 
 
-_thread_local_http = threading.local()
+import urllib3
+
+_pool_manager = None
+_pool_lock = threading.Lock()
+_last_health_check_time = 0.0
+_last_health_status = True
+_health_lock = threading.Lock()
 
 
-def _get_http_connection(netloc: str, timeout: float = 10.0) -> http.client.HTTPConnection:
-    conn_map = getattr(_thread_local_http, "conns", None)
-    if conn_map is None:
-        conn_map = {}
-        _thread_local_http.conns = conn_map
-    conn = conn_map.get(netloc)
-    if conn is None:
-        conn = http.client.HTTPConnection(netloc, timeout=timeout)
-        conn_map[netloc] = conn
-    return conn
+def _get_pool() -> urllib3.PoolManager:
+    global _pool_manager
+    if _pool_manager is None:
+        with _pool_lock:
+            if _pool_manager is None:
+                retries = urllib3.Retry(
+                    total=3,
+                    backoff_factor=0.01,
+                    status_forcelist=[500, 502, 503, 504],
+                    raise_on_status=False,
+                )
+                _pool_manager = urllib3.PoolManager(
+                    maxsize=200,
+                    retries=retries,
+                    timeout=urllib3.Timeout(connect=2.0, read=5.0),
+                )
+    return _pool_manager
 
 
-def _http_request(url: str, method: str = "GET", data: dict | None = None, timeout: float = 10.0) -> dict | None:
-    """Perform persistent HTTP/1.1 JSON request to remote DB microservice reusing TCP connections."""
-    parsed = urllib.parse.urlparse(url)
-    netloc = parsed.netloc
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
+def _record_db_success():
+    global _last_health_check_time, _last_health_status
+    with _health_lock:
+        _last_health_check_time = time.time()
+        _last_health_status = True
 
+
+def _http_request(url: str, method: str = "GET", data: dict | None = None, timeout: float = 5.0) -> dict | None:
+    """Perform pooled HTTP/1.1 JSON request to remote DB microservice reusing persistent TCP connections."""
+    pool = _get_pool()
     headers = {
         "Content-Type": "application/json",
         "Connection": "keep-alive",
     }
     body_bytes = json.dumps(data).encode("utf-8") if data is not None else None
 
-    for attempt in range(2):
-        conn = _get_http_connection(netloc, timeout=timeout)
+    try:
+        resp = pool.request(
+            method,
+            url,
+            body=body_bytes,
+            headers=headers,
+            timeout=timeout,
+        )
+        if resp.status == 404:
+            return None
+        if resp.status >= 500:
+            raise RuntimeError(f"Remote DB error: HTTP {resp.status}")
+        content = resp.data.decode("utf-8")
+        _record_db_success()
+        if not content:
+            return {}
+        return json.loads(content)
+    except Exception as e:
+        # Retry with standard urlopen as ultimate fail-safe
         try:
-            conn.request(method, path, body=body_bytes, headers=headers)
-            resp = conn.getresponse()
-            if resp.status == 404:
-                resp.read()
-                return None
-            content = resp.read().decode("utf-8")
-            if not content:
-                return {}
-            return json.loads(content)
-        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError, http.client.CannotSendRequest, http.client.BadStatusLine):
-            # Stale keep-alive connection, close and retry once with a fresh socket
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if hasattr(_thread_local_http, "conns"):
-                _thread_local_http.conns.pop(netloc, None)
-            if attempt == 1:
-                # Fallback to standard urlopen on final attempt
-                req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
-                with urllib.request.urlopen(req, timeout=timeout) as fb_resp:
-                    fb_content = fb_resp.read().decode("utf-8")
-                    return json.loads(fb_content) if fb_content else {}
+            req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as fb_resp:
+                fb_content = fb_resp.read().decode("utf-8")
+                _record_db_success()
+                return json.loads(fb_content) if fb_content else {}
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if hasattr(_thread_local_http, "conns"):
-                _thread_local_http.conns.pop(netloc, None)
             raise
 
 
@@ -111,11 +119,20 @@ def get_db_connection(db_path: str | None = None, timeout: float = 30.0) -> sqli
 
 def check_db_health(db_path: str | None = None, timeout: float = 2.0) -> bool:
     """Lightweight check verifying database connectivity (local file or remote HTTP server)."""
+    global _last_health_check_time, _last_health_status
     target_path = db_path or get_db_path()
     if is_remote_db(target_path):
+        now = time.time()
+        with _health_lock:
+            if (now - _last_health_check_time) < 3.0 and _last_health_status:
+                return True
         try:
             res = _http_request(f"{target_path.rstrip('/')}/health", timeout=timeout)
-            return res is not None and res.get("status") == "healthy"
+            healthy = res is not None and res.get("status") == "healthy"
+            with _health_lock:
+                _last_health_check_time = now
+                _last_health_status = healthy
+            return healthy
         except Exception:
             return False
 
