@@ -898,8 +898,11 @@ def create_app(backend_id: str | None = None, db_path: str | None = None) -> web
 
 
 def main():
-    # Initialize Database tables and migrations
-    init_db(DB_PATH)
+    # Initialize Database tables and migrations (non-fatal if remote DB is starting up)
+    try:
+        init_db(DB_PATH)
+    except Exception as e:
+        print(f"[WARN] Database initialization warning on startup: {e}")
 
     print("=" * 60)
     print(f"   SECURE GROUP CHAT BACKEND [{BACKEND_ID}]")

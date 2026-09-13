@@ -151,7 +151,10 @@ def init_db(db_path: str = DB_PATH) -> None:
     """Initialize database tables for messages and public keys with WAL and safe migrations."""
     target_path = db_path or get_db_path()
     if is_remote_db(target_path):
-        _http_request(f"{target_path.rstrip('/')}/init", method="POST")
+        try:
+            _http_request(f"{target_path.rstrip('/')}/init", method="POST", timeout=2.0)
+        except Exception:
+            pass
         return
 
     con = get_db_connection(target_path)
