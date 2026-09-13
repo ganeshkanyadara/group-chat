@@ -7,6 +7,8 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+import http.client
+import threading
 
 
 def get_db_path() -> str:
@@ -29,25 +31,69 @@ def is_remote_db(db_path: str | None = None) -> bool:
     return target.startswith("http://") or target.startswith("https://")
 
 
+_thread_local_http = threading.local()
+
+
+def _get_http_connection(netloc: str, timeout: float = 10.0) -> http.client.HTTPConnection:
+    conn_map = getattr(_thread_local_http, "conns", None)
+    if conn_map is None:
+        conn_map = {}
+        _thread_local_http.conns = conn_map
+    conn = conn_map.get(netloc)
+    if conn is None:
+        conn = http.client.HTTPConnection(netloc, timeout=timeout)
+        conn_map[netloc] = conn
+    return conn
+
+
 def _http_request(url: str, method: str = "GET", data: dict | None = None, timeout: float = 10.0) -> dict | None:
-    """Perform synchronous JSON HTTP request to remote DB microservice on System 1."""
-    headers = {"Content-Type": "application/json"}
+    """Perform persistent HTTP/1.1 JSON request to remote DB microservice reusing TCP connections."""
+    parsed = urllib.parse.urlparse(url)
+    netloc = parsed.netloc
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+    }
     body_bytes = json.dumps(data).encode("utf-8") if data is not None else None
-    req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content = resp.read().decode("utf-8")
-            return json.loads(content) if content else {}
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        content = e.read().decode("utf-8")
+
+    for attempt in range(2):
+        conn = _get_http_connection(netloc, timeout=timeout)
         try:
+            conn.request(method, path, body=body_bytes, headers=headers)
+            resp = conn.getresponse()
+            if resp.status == 404:
+                resp.read()
+                return None
+            content = resp.read().decode("utf-8")
+            if not content:
+                return {}
             return json.loads(content)
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError, http.client.CannotSendRequest, http.client.BadStatusLine):
+            # Stale keep-alive connection, close and retry once with a fresh socket
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if hasattr(_thread_local_http, "conns"):
+                _thread_local_http.conns.pop(netloc, None)
+            if attempt == 1:
+                # Fallback to standard urlopen on final attempt
+                req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+                with urllib.request.urlopen(req, timeout=timeout) as fb_resp:
+                    fb_content = fb_resp.read().decode("utf-8")
+                    return json.loads(fb_content) if fb_content else {}
         except Exception:
-            raise e
-    except Exception:
-        raise
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if hasattr(_thread_local_http, "conns"):
+                _thread_local_http.conns.pop(netloc, None)
+            raise
 
 
 def get_db_connection(db_path: str | None = None, timeout: float = 30.0) -> sqlite3.Connection:

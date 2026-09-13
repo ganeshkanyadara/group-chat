@@ -1,9 +1,16 @@
-// Dynamically connect to the backend WebSocket server
+// Dynamically connect to the Load Balancer or backend WebSocket server
 function getDefaultEndpoint() {
+    try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get("server")) {
+            return params.get("server");
+        }
+    } catch (e) {}
+
     if (window.location.host && window.location.protocol.startsWith("http")) {
         return window.location.host;
     }
-    return "10.1.75.51:4215";
+    return "10.1.75.51:7213";
 }
 
 // ============================================================
@@ -278,7 +285,8 @@ function handleServerMessage(data, endpoint) {
         loginScreen.classList.add("hidden");
         chatScreen.classList.remove("hidden");
 
-        updateConnectionStatus(true, endpoint);
+        const statusLabel = data.backend_id ? `${endpoint} via ${data.backend_id}` : endpoint;
+        updateConnectionStatus(true, statusLabel);
         messageInput.focus();
         return;
     }

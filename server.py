@@ -238,8 +238,8 @@ async def metrics_middleware(request: web.Request, handler):
         metrics_tracker.record_request(elapsed_ms)
         metrics_tracker.decrement_active()
 
-        # Log assessment / internal requests concisely
-        if request.path in ("/message", "/feed", "/health", "/metrics"):
+        # Only log errors or slow requests (> 1000ms) to avoid stdout locking under heavy concurrency
+        if status_code >= 400 or elapsed_ms > 1000:
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             print(f"[{ts}] [{backend_id}] {request.method} {request.path} -> {status_code} ({elapsed_ms:.2f}ms)")
 
